@@ -913,12 +913,12 @@ namespace MujassamPortable
                 else
                     action();
             }
+            catch (ObjectDisposedException)
+            {
+            }
             catch (InvalidOperationException)
             {
                 // The window closed while a final worker line was being delivered.
-            }
-            catch (ObjectDisposedException)
-            {
             }
         }
 
