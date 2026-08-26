@@ -392,6 +392,34 @@ $UpstreamRequirements |
     --no-cache-dir `
     -r (Join-Path $SourceRoot "requirements-remesh.txt")
 
+# transparent-background 1.3.3 imports its optional Flet GUI from package
+# __init__.py. Mujassam only uses Remover, and current Flet releases removed
+# symbols expected by that old GUI. Keep the inference API headless so an
+# unrelated GUI dependency cannot prevent SPAR3D from importing.
+$TransparentBackgroundInit = Join-Path $BuildVenv (
+    "Lib\site-packages\transparent_background\__init__.py"
+)
+if (-not (Test-Path $TransparentBackgroundInit -PathType Leaf)) {
+    throw "transparent-background package init file was not installed"
+}
+$TransparentBackgroundInitText = Get-Content $TransparentBackgroundInit -Raw
+$TransparentBackgroundGuiImport = (
+    '(?m)^\s*from transparent_background\.gui import gui\s*\r?\n?'
+)
+if ($TransparentBackgroundInitText -notmatch $TransparentBackgroundGuiImport) {
+    throw "Expected transparent-background 1.3.3 GUI import was not found"
+}
+$TransparentBackgroundInitText = (
+    $TransparentBackgroundInitText -replace $TransparentBackgroundGuiImport, ""
+)
+$TransparentBackgroundInitText |
+    Set-Content $TransparentBackgroundInit -Encoding utf8 -NoNewline
+
+& $BuildPython -c (
+    "from transparent_background import Remover; " +
+    "print('transparent-background headless import: OK')"
+)
+
 $env:USE_CUDA = "1"
 $env:USE_NATIVE_ARCH = "0"
 $env:TORCH_CUDA_ARCH_LIST = "8.9"
