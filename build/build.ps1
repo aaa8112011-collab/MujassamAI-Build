@@ -592,6 +592,9 @@ if (Test-Path $GuiSelfTestReport) {
 # Copy the current VC runtime and OpenMP redistributables app-locally.
 $RedistBase = Join-Path $VsInstall "VC\Redist\MSVC"
 $LatestRedist = Get-ChildItem $RedistBase -Directory |
+    # Visual Studio also creates aliases such as "v143" beside numbered
+    # redist directories. Only parse names that are real dotted versions.
+    Where-Object { $_.Name -match '^\d+(\.\d+){1,3}$' } |
     Sort-Object { [version]$_.Name } -Descending |
     Select-Object -First 1
 
