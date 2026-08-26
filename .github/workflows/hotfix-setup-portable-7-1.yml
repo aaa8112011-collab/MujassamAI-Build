@@ -1,0 +1,218 @@
+name: Hotfix Setup portable-7-1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  hotfix-setup:
+    name: Compile and replace Setup.exe only
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: portable-7-1
+      MANIFEST_SHA256: dbde9669b379bee5e68f7f58d0dbded6c4a9583dd8c354fe5aef8bbfdfafdf8a
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v4
+
+      - name: Compile, verify, and publish Setup hotfix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          if ($env:GITHUB_REPOSITORY -ne "aaa8112011-collab/MujassamAI-Build") {
+              throw "This pinned hotfix may run only in aaa8112011-collab/MujassamAI-Build"
+          }
+
+          $Work = Join-Path $env:RUNNER_TEMP "mujassam-setup-hotfix"
+          $ManifestDir = Join-Path $Work "manifest"
+          $BackupDir = Join-Path $Work "backup"
+          $OutputDir = Join-Path $Work "output"
+          $VerifyDir = Join-Path $Work "verify"
+          New-Item -ItemType Directory -Path $ManifestDir, $BackupDir, $OutputDir, $VerifyDir | Out-Null
+
+          gh release download $env:RELEASE_TAG `
+              --repo $env:GITHUB_REPOSITORY `
+              --pattern "release-manifest.json" `
+              --dir $ManifestDir
+          gh release download $env:RELEASE_TAG `
+              --repo $env:GITHUB_REPOSITORY `
+              --pattern "Setup.exe" `
+              --dir $BackupDir
+
+          $ManifestPath = Join-Path $ManifestDir "release-manifest.json"
+          $ManifestHash = (Get-FileHash $ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($ManifestHash -ne $env:MANIFEST_SHA256) {
+              throw "The pinned release manifest changed; refusing to replace Setup.exe"
+          }
+
+          $ReleaseBefore = gh api "repos/$($env:GITHUB_REPOSITORY)/releases/tags/$($env:RELEASE_TAG)" |
+              ConvertFrom-Json
+          if ($ReleaseBefore.draft -or $ReleaseBefore.prerelease) {
+              throw "The target release must be a published full release"
+          }
+          $ProtectedBefore = @($ReleaseBefore.assets |
+              Where-Object { $_.name -ne "Setup.exe" } |
+              Sort-Object name |
+              ForEach-Object { "$($_.id)|$($_.name)|$($_.size)|$($_.digest)" }) -join "`n"
+          $ManifestAsset = @($ReleaseBefore.assets | Where-Object { $_.name -eq "release-manifest.json" })
+          if ($ManifestAsset.Count -ne 1 -or
+              $ManifestAsset[0].digest -ne "sha256:$($env:MANIFEST_SHA256)") {
+              throw "The release manifest asset does not match the pinned digest"
+          }
+
+          $SourcePath = Join-Path $env:GITHUB_WORKSPACE "installer\Setup.cs"
+          $PatchedSource = Join-Path $Work "MujassamAI-Setup.cs"
+          $ReleaseBase = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$($env:RELEASE_TAG)"
+          $SourceText = Get-Content $SourcePath -Raw
+          $Markers = @(
+              "@@RELEASE_BASE_URL@@",
+              "@@GITHUB_REPOSITORY@@",
+              "@@RELEASE_TAG@@",
+              "@@MANIFEST_SHA256@@"
+          )
+          foreach ($Marker in $Markers) {
+              if (-not $SourceText.Contains($Marker)) {
+                  throw "Setup.cs is missing required marker: $Marker"
+              }
+          }
+          $SourceText = $SourceText.Replace("@@RELEASE_BASE_URL@@", $ReleaseBase)
+          $SourceText = $SourceText.Replace("@@GITHUB_REPOSITORY@@", $env:GITHUB_REPOSITORY)
+          $SourceText = $SourceText.Replace("@@RELEASE_TAG@@", $env:RELEASE_TAG)
+          $SourceText = $SourceText.Replace("@@MANIFEST_SHA256@@", $env:MANIFEST_SHA256)
+          foreach ($Marker in $Markers) {
+              if ($SourceText.Contains($Marker)) {
+                  throw "Setup.cs still contains an unresolved marker"
+              }
+          }
+          $SourceText | Set-Content $PatchedSource -Encoding utf8
+
+          $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $VsInstall = & $VsWhere -latest -products * -requires Microsoft.Component.MSBuild `
+              -property installationPath
+          $Csc = Join-Path $VsInstall "MSBuild\Current\Bin\Roslyn\csc.exe"
+          $ReferenceRoot = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8"
+          if (-not (Test-Path $Csc -PathType Leaf) -or
+              -not (Test-Path $ReferenceRoot -PathType Container)) {
+              throw ".NET Framework 4.8 compiler/reference assemblies were not found"
+          }
+
+          $AppManifest = Join-Path $Work "MujassamAI-Setup.manifest"
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+            <assemblyIdentity version="1.0.0.0" name="MujassamAI.Setup" />
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+              <security><requestedPrivileges>
+                <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+              </requestedPrivileges></security>
+            </trustInfo>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3">
+              <windowsSettings>
+                <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+              </windowsSettings>
+            </application>
+            <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+              <application>
+                <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+              </application>
+            </compatibility>
+            <dependency><dependentAssembly>
+              <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                version="6.0.0.0" processorArchitecture="*"
+                publicKeyToken="6595b64144ccf1df" language="*" />
+            </dependentAssembly></dependency>
+          </assembly>
+          '@ | Set-Content $AppManifest -Encoding utf8
+
+          $ReferenceNames = @(
+              "System.dll",
+              "System.Core.dll",
+              "System.Drawing.dll",
+              "System.Windows.Forms.dll",
+              "System.Web.Extensions.dll",
+              "System.Net.Http.dll",
+              "System.IO.Compression.dll",
+              "System.IO.Compression.FileSystem.dll",
+              "System.Runtime.Serialization.dll"
+          )
+          $References = @($ReferenceNames | ForEach-Object {
+              $ReferencePath = Join-Path $ReferenceRoot $_
+              if (-not (Test-Path $ReferencePath -PathType Leaf)) {
+                  throw "Missing reference assembly: $ReferencePath"
+              }
+              "/reference:$ReferencePath"
+          })
+          $NewSetup = Join-Path $OutputDir "Setup.exe"
+          $CscArguments = @(
+              "/nologo",
+              "/noconfig",
+              "/target:winexe",
+              "/platform:x64",
+              "/optimize+",
+              "/debug-",
+              "/langversion:latest",
+              "/win32manifest:$AppManifest",
+              "/out:$NewSetup"
+          ) + $References + @($PatchedSource)
+          & $Csc @CscArguments
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $NewSetup -PathType Leaf)) {
+              throw "Setup.exe compilation failed"
+          }
+
+          $SelfTest = Join-Path $Work "self-test.txt"
+          & $NewSetup --self-test $SelfTest
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $SelfTest -PathType Leaf)) {
+              throw "Setup.exe self-test failed"
+          }
+          $SelfTestText = Get-Content $SelfTest -Raw
+          if (-not $SelfTestText.Contains("ReleaseBase=$ReleaseBase/") -or
+              -not $SelfTestText.Contains("ManifestSHA256=$($env:MANIFEST_SHA256)")) {
+              throw "Setup.exe self-test reported the wrong pinned release"
+          }
+
+          $BackupSetup = Join-Path $BackupDir "Setup.exe"
+          try {
+              gh release upload $env:RELEASE_TAG $NewSetup `
+                  --repo $env:GITHUB_REPOSITORY --clobber
+
+              $ReleaseAfter = gh api "repos/$($env:GITHUB_REPOSITORY)/releases/tags/$($env:RELEASE_TAG)" |
+                  ConvertFrom-Json
+              $ProtectedAfter = @($ReleaseAfter.assets |
+                  Where-Object { $_.name -ne "Setup.exe" } |
+                  Sort-Object name |
+                  ForEach-Object { "$($_.id)|$($_.name)|$($_.size)|$($_.digest)" }) -join "`n"
+              if ($ProtectedAfter -cne $ProtectedBefore) {
+                  throw "A protected release asset changed during the Setup-only hotfix"
+              }
+              $SetupAssets = @($ReleaseAfter.assets | Where-Object { $_.name -eq "Setup.exe" })
+              if ($SetupAssets.Count -ne 1) {
+                  throw "The release must contain exactly one Setup.exe asset"
+              }
+
+              gh release download $env:RELEASE_TAG `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --pattern "Setup.exe" `
+                  --dir $VerifyDir
+              $LocalHash = (Get-FileHash $NewSetup -Algorithm SHA256).Hash
+              $RemoteHash = (Get-FileHash (Join-Path $VerifyDir "Setup.exe") -Algorithm SHA256).Hash
+              if ($LocalHash -cne $RemoteHash) {
+                  throw "The uploaded Setup.exe digest does not match the compiled hotfix"
+              }
+          }
+          catch {
+              Write-Warning "Hotfix verification failed; restoring the previous Setup.exe"
+              if (Test-Path $BackupSetup -PathType Leaf) {
+                  gh release upload $env:RELEASE_TAG $BackupSetup `
+                      --repo $env:GITHUB_REPOSITORY --clobber
+              }
+              throw
+          }
+
+          Write-Host "Setup-only hotfix published successfully"

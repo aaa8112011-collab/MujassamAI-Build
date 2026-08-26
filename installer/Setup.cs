@@ -451,8 +451,14 @@ namespace MujassamInstaller
             {
                 statusLabel.Text = "تعذر إكمال التثبيت";
                 AppendLog("خطأ: " + error.Message);
+                string diagnosticPath = WriteFailureLog(error);
+                if (!String.IsNullOrWhiteSpace(diagnosticPath))
+                    AppendLog("سجل التشخيص: " + diagnosticPath);
                 MessageBox.Show(this,
-                    "تعذر إكمال التثبيت. لم يُشغّل أي ملف غير متحقق منه.\r\n\r\n" + error.Message,
+                    "تعذر إكمال التثبيت. لم يُشغّل أي ملف غير متحقق منه.\r\n\r\n" +
+                    error.Message + (String.IsNullOrWhiteSpace(diagnosticPath)
+                        ? String.Empty
+                        : "\r\n\r\nسجل التشخيص:\r\n" + diagnosticPath),
                     Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
@@ -482,6 +488,28 @@ namespace MujassamInstaller
                 statusLabel.Text = value.Status;
             if (!String.IsNullOrWhiteSpace(value.Detail))
                 AppendLog(value.Detail);
+        }
+
+        private static string WriteFailureLog(Exception error)
+        {
+            try
+            {
+                string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                if (String.IsNullOrWhiteSpace(local))
+                    local = Path.GetTempPath();
+                string folder = Path.Combine(local, "MujassamAI", "InstallerLogs");
+                Directory.CreateDirectory(folder);
+                string path = Path.Combine(folder,
+                    "install-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff",
+                        CultureInfo.InvariantCulture) + ".log");
+                File.WriteAllText(path, error == null ? "Unknown installer error" : error.ToString(),
+                    new UTF8Encoding(false));
+                return path;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private void AppendLog(string value)
@@ -625,15 +653,14 @@ namespace MujassamInstaller
             if (String.IsNullOrWhiteSpace(installParent))
                 throw new InstallerException("مسار التثبيت غير صالح.");
             Directory.CreateDirectory(installParent);
-            string stagingRoot = Path.Combine(installParent,
-                ".MujassamAI-" + Guid.NewGuid().ToString("N").Substring(0, 12));
-            EnsureLegacyPathLength(stagingRoot, true);
             EnsureLegacyPathLength(installRoot, true);
 
             string previousInstall = null;
+            string stagingRoot = null;
             try
             {
-                Directory.CreateDirectory(stagingRoot);
+                Report(progress, 66, "جارٍ تجهيز مجلد التثبيت...", null);
+                stagingRoot = CreateWritableStagingRoot(installParent);
                 Report(progress, 66, "جارٍ فك الحزمة بأمان...", null);
                 await ExtractArchiveSafelyAsync(runtimeArchive, stagingRoot,
                     manifest.Model.Bytes, progress, cancellationToken).ConfigureAwait(false);
@@ -1318,9 +1345,58 @@ namespace MujassamInstaller
             }
         }
 
+        private static string CreateWritableStagingRoot(string installParent)
+        {
+            string stagingParent = installParent;
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!String.IsNullOrWhiteSpace(local))
+            {
+                string localStageParent = Path.Combine(local, "MujassamAI", "InstallerStage");
+                string installDrive = Path.GetPathRoot(Path.GetFullPath(installParent));
+                string localDrive = Path.GetPathRoot(Path.GetFullPath(localStageParent));
+                if (!String.IsNullOrWhiteSpace(installDrive) &&
+                    String.Equals(installDrive, localDrive, StringComparison.OrdinalIgnoreCase))
+                {
+                    stagingParent = localStageParent;
+                }
+            }
+
+            Directory.CreateDirectory(stagingParent);
+            Exception lastError = null;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                string candidate = Path.Combine(stagingParent,
+                    "MujassamAI-Installing-" + Guid.NewGuid().ToString("N").Substring(0, 12));
+                EnsureLegacyPathLength(candidate, true);
+                try
+                {
+                    Directory.CreateDirectory(candidate);
+                    if (!Directory.Exists(candidate))
+                        throw new IOException("لم يظهر مجلد التجهيز بعد إنشائه.");
+                    string probe = Path.Combine(candidate, "write-test.tmp");
+                    File.WriteAllText(probe, "MujassamAI", new UTF8Encoding(false));
+                    File.Delete(probe);
+                    return candidate;
+                }
+                catch (Exception error)
+                {
+                    lastError = error;
+                    TryDeleteDirectory(candidate);
+                }
+            }
+            throw new InstallerException(
+                "تعذر إنشاء مجلد تجهيز قابل للكتابة. تحقق من Windows Security ثم أعد المحاولة.",
+                lastError);
+        }
+
         private static string CommitStagedApplication(string stagingRoot, string installRoot)
         {
             string backup = null;
+            if (String.IsNullOrWhiteSpace(stagingRoot) || !Directory.Exists(stagingRoot))
+            {
+                throw new InstallerException(
+                    "اختفى مجلد التجهيز قبل إنهاء التثبيت. قد يكون برنامج الحماية قد عزله.");
+            }
             if (File.Exists(installRoot))
                 throw new InstallerException("يوجد ملف مكان مجلد التثبيت المطلوب: " + installRoot);
             if (Directory.Exists(installRoot))
@@ -1329,7 +1405,7 @@ namespace MujassamInstaller
                 if ((attributes & FileAttributes.ReparsePoint) != 0)
                     throw new InstallerException("رفض المثبّت استبدال مجلد تثبيت من نوع link أو junction.");
                 backup = Path.Combine(Path.GetDirectoryName(installRoot),
-                    ".MujassamAI-old-" + Guid.NewGuid().ToString("N").Substring(0, 12));
+                    "MujassamAI-Previous-" + Guid.NewGuid().ToString("N").Substring(0, 12));
                 EnsureLegacyPathLength(backup, true);
                 Directory.Move(installRoot, backup);
             }
@@ -1372,7 +1448,7 @@ namespace MujassamInstaller
             }
 
             string failed = Path.Combine(Path.GetDirectoryName(installRoot),
-                ".MujassamAI-failed-" + Guid.NewGuid().ToString("N").Substring(0, 12));
+                "MujassamAI-Failed-" + Guid.NewGuid().ToString("N").Substring(0, 12));
             EnsureLegacyPathLength(failed, true);
             bool movedNewInstall = false;
             try
