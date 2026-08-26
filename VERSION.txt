@@ -1,0 +1,8 @@
+Mujassam AI Portable 0.2.0
+SPAR3D source: fdc311b16809e6a8adc2f5a3407ebb3db1a95bd1
+SPAR3D model: 5699918cb34f55cd7d828493d2725f3038313761
+Python: 3.11.9 application-local x64
+PyTorch: 2.5.1+cu124
+TorchVision: 0.20.1+cu124
+CUDA extensions: 12.4 / SM 8.9
+Distribution: GitHub Release parts + release-manifest.json + Setup.exe
