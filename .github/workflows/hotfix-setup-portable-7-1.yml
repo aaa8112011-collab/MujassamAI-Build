@@ -167,9 +167,14 @@ jobs:
           }
 
           $SelfTest = Join-Path $Work "self-test.txt"
-          & $NewSetup --self-test $SelfTest
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $SelfTest -PathType Leaf)) {
-              throw "Setup.exe self-test failed"
+          $SelfTestProcess = Start-Process -FilePath $NewSetup `
+              -ArgumentList @("--self-test", $SelfTest) -Wait -PassThru
+          if ($SelfTestProcess.ExitCode -ne 0 -or
+              -not (Test-Path $SelfTest -PathType Leaf)) {
+              if (Test-Path $SelfTest -PathType Leaf) {
+                  Write-Host (Get-Content $SelfTest -Raw)
+              }
+              throw "Setup.exe self-test failed with exit code $($SelfTestProcess.ExitCode)"
           }
           $SelfTestText = Get-Content $SelfTest -Raw
           if (-not $SelfTestText.Contains("ReleaseBase=$ReleaseBase/") -or
