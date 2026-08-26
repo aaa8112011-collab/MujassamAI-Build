@@ -26,7 +26,7 @@ $BuildVenv = Join-Path $env:RUNNER_TEMP "mujassam-build-venv"
 $Wheelhouse = Join-Path $env:RUNNER_TEMP "mujassam-wheelhouse"
 $RuntimeArchive = Join-Path $env:RUNNER_TEMP "runtime.zip"
 $WeightsRecordPath = Join-Path $env:RUNNER_TEMP "mujassam-weights-record.json"
-$ReleasePartSize = 1_890_000_000
+$ReleasePartSize = 1890000000
 $ReleaseTag = if ([string]::IsNullOrWhiteSpace($env:RELEASE_TAG)) {
     "portable-local"
 } else {
@@ -141,7 +141,7 @@ function Assert-ReleaseParts {
     foreach ($part in $Record.parts) {
         $PartPath = Join-Path $ReleaseRoot $part.name
         $PartItem = Get-Item $PartPath
-        if ($PartItem.Length -ge 1_900_000_000) {
+        if ($PartItem.Length -ge 1900000000) {
             throw "Release asset is not below 1.9 GB: $($part.name)"
         }
         $ActualPartHash = (
