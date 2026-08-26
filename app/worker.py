@@ -37,6 +37,17 @@ TEXTURE_RESOLUTIONS = {1024, 2048}
 TARGETS = {"roblox", "unreal"}
 ROBLOX_VERTEX_TARGETS = {"balanced": 10_000, "high": 25_000}
 
+# SPAR3D's pinned exporter marks its baked textures as JPEG. Trimesh then
+# recompresses them while writing the GLB, which visibly damages fine detail.
+# Keep SPAR3D's GPU bake capped at 2K for 8 GB cards, then create lossless
+# display textures on CPU. Ultra+ stays at Roblox's 4K limit with stronger
+# detail enhancement, while Unreal gets an optional 8K color map and 4K normal.
+ULTRA_SOURCE_RESOLUTION = 2048
+ULTRA_TEXTURE_SIZE = 4096
+ULTRA_PLUS_TEXTURE_SIZE = 8192
+ULTRA_SHARPEN = {"radius": 1.15, "percent": 110, "threshold": 2}
+ULTRA_PLUS_SHARPEN = {"radius": 1.35, "percent": 145, "threshold": 2}
+
 APP_ROOT = Path(__file__).resolve().parent
 BUNDLE_ROOT = APP_ROOT.parent.resolve()
 VENDOR_ROOT = APP_ROOT / "vendor" / "stable-point-aware-3d"
@@ -530,7 +541,7 @@ def _import_runtime(bundle: BundlePaths) -> dict[str, Any]:
     sys.path.insert(0, vendor_string)
     try:
         import torch
-        from PIL import Image, ImageOps, UnidentifiedImageError
+        from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
         from spar3d.models.mesh import TRIANGLE_REMESH_AVAILABLE
         from spar3d.system import SPAR3D
         from spar3d.models.tokenizers.dinov2 import Dinov2Model
@@ -561,6 +572,7 @@ def _import_runtime(bundle: BundlePaths) -> dict[str, Any]:
     return {
         "torch": torch,
         "Image": Image,
+        "ImageFilter": ImageFilter,
         "ImageOps": ImageOps,
         "UnidentifiedImageError": UnidentifiedImageError,
         "SPAR3D": SPAR3D,
@@ -640,7 +652,131 @@ def _prepare_image(
     }
 
 
-def _glb_metadata(path: Path) -> dict[str, int]:
+def _scaled_texture_size(size: tuple[int, int], longest_edge: int) -> tuple[int, int]:
+    width, height = (int(size[0]), int(size[1]))
+    if width < 1 or height < 1 or longest_edge < 1:
+        raise WorkerError("texture-enhance", "The baked texture has invalid dimensions")
+    scale = float(longest_edge) / float(max(width, height))
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _enhance_texture_image(
+    source: Any,
+    *,
+    longest_edge: int,
+    runtime: dict[str, Any],
+    sharpen: dict[str, float | int] | None,
+) -> Any:
+    """Resize one PIL texture losslessly and sharpen luminance when requested."""
+
+    Image = runtime["Image"]
+    ImageFilter = runtime["ImageFilter"]
+    if source is None or not hasattr(source, "convert") or not hasattr(source, "size"):
+        raise WorkerError("texture-enhance", "The baked material texture is invalid")
+
+    try:
+        has_alpha = "A" in source.getbands()
+        converted = source.convert("RGBA" if has_alpha else "RGB")
+        output_size = _scaled_texture_size(converted.size, longest_edge)
+        if converted.size != output_size:
+            converted = converted.resize(output_size, Image.Resampling.LANCZOS)
+
+        if sharpen is not None:
+            # Sharpen only luminance. Sharpening RGB independently can create
+            # colored halos around UV seams; normal/data maps never use this.
+            alpha = converted.getchannel("A") if has_alpha else None
+            rgb = converted.convert("RGB")
+            y, cb, cr = rgb.convert("YCbCr").split()
+            y = y.filter(
+                ImageFilter.UnsharpMask(
+                    radius=float(sharpen["radius"]),
+                    percent=int(sharpen["percent"]),
+                    threshold=int(sharpen["threshold"]),
+                )
+            )
+            converted = Image.merge("YCbCr", (y, cb, cr)).convert("RGB")
+            if alpha is not None:
+                converted.putalpha(alpha)
+
+        # Trimesh 4.4.x preserves JPEG only when PIL's format equals JPEG.
+        # Setting PNG makes the GLB embed a lossless image.
+        converted.format = "PNG"
+        return converted
+    except WorkerError:
+        raise
+    except Exception as exc:
+        raise WorkerError(
+            "texture-enhance", f"Could not enhance a baked texture: {exc}"
+        ) from exc
+
+
+def _capture_material_textures(mesh: Any) -> tuple[Any, dict[str, Any]]:
+    material = getattr(getattr(mesh, "visual", None), "material", None)
+    if material is None:
+        raise WorkerError("texture-enhance", "The generated mesh has no material")
+
+    textures: dict[str, Any] = {}
+    for attribute in (
+        "baseColorTexture",
+        "normalTexture",
+        "metallicRoughnessTexture",
+        "emissiveTexture",
+        "occlusionTexture",
+    ):
+        value = getattr(material, attribute, None)
+        if (
+            value is not None
+            and hasattr(value, "copy")
+            and hasattr(value, "convert")
+            and hasattr(value, "size")
+        ):
+            textures[attribute] = value.copy()
+
+    # Some Trimesh material variants expose the color texture as image.
+    if "baseColorTexture" not in textures:
+        fallback = getattr(material, "image", None)
+        if (
+            fallback is not None
+            and hasattr(fallback, "copy")
+            and hasattr(fallback, "convert")
+            and hasattr(fallback, "size")
+        ):
+            textures["image"] = fallback.copy()
+    if not any(key in textures for key in ("baseColorTexture", "image")):
+        raise WorkerError("texture-enhance", "The generated material has no color texture")
+    return material, textures
+
+
+def _apply_texture_profile(
+    material: Any,
+    source_textures: dict[str, Any],
+    *,
+    color_size: int,
+    data_size: int,
+    sharpen: dict[str, float | int],
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    enhanced: dict[str, dict[str, Any]] = {}
+    for attribute, source in source_textures.items():
+        is_color = attribute in {"baseColorTexture", "image", "emissiveTexture"}
+        target_size = color_size if is_color else data_size
+        result = _enhance_texture_image(
+            source,
+            longest_edge=target_size,
+            runtime=runtime,
+            sharpen=sharpen if is_color else None,
+        )
+        setattr(material, attribute, result)
+        enhanced[attribute] = {
+            "source_size": [int(source.size[0]), int(source.size[1])],
+            "output_size": [int(result.size[0]), int(result.size[1])],
+            "encoding": "PNG",
+            "luminance_sharpened": bool(is_color),
+        }
+    return enhanced
+
+
+def _glb_metadata(path: Path) -> dict[str, Any]:
     try:
         file_size = path.stat().st_size
         if file_size < 20:
@@ -659,11 +795,18 @@ def _glb_metadata(path: Path) -> dict[str, int]:
         mesh_count = len(document.get("meshes", []))
         if mesh_count < 1:
             raise ValueError("GLB contains no meshes")
+        image_mime_types = [
+            str(image.get("mimeType", ""))
+            for image in document.get("images", [])
+            if isinstance(image, dict)
+        ]
         return {
             "bytes": file_size,
             "meshes": mesh_count,
             "materials": len(document.get("materials", [])),
             "images": len(document.get("images", [])),
+            "png_images": sum(value == "image/png" for value in image_mime_types),
+            "jpeg_images": sum(value == "image/jpeg" for value in image_mime_types),
             "nodes": len(document.get("nodes", [])),
         }
     except (OSError, UnicodeError, json.JSONDecodeError, struct.error, ValueError) as exc:
@@ -788,13 +931,6 @@ def _run_job(job: Job) -> Path:
         except Exception as exc:
             raise WorkerError("reconstruction", f"SPAR3D reconstruction failed: {exc}") from exc
 
-        _emit_progress(84, "Exporting GLB")
-        glb_path = staging / "model.glb"
-        try:
-            mesh.export(str(glb_path), include_normals=True)
-        except Exception as exc:
-            raise WorkerError("glb-export", f"GLB export failed: {exc}") from exc
-
         points_path = staging / "points.ply"
         points_exported = False
         try:
@@ -805,9 +941,107 @@ def _run_job(job: Job) -> Path:
         except Exception:
             points_path.unlink(missing_ok=True)
 
-        _emit_progress(91, "Validating the exported asset")
+        # The neural model is no longer needed. Release it before CPU texture
+        # enhancement so Ultra+ has as much RAM/VRAM headroom as possible.
+        generation = None
+        image = None
+        model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        material, source_textures = _capture_material_textures(mesh)
+        if job.texture_resolution == ULTRA_SOURCE_RESOLUTION:
+            _emit_progress(82, "Creating lossless Ultra 4K textures")
+            texture_profile = "ultra-4k-lossless"
+            texture_info = _apply_texture_profile(
+                material,
+                source_textures,
+                color_size=ULTRA_TEXTURE_SIZE,
+                data_size=ULTRA_TEXTURE_SIZE,
+                sharpen=ULTRA_SHARPEN,
+                runtime=runtime,
+            )
+        else:
+            _emit_progress(82, "Preserving baked textures as lossless PNG")
+            texture_profile = "lossless-native"
+            texture_info = _apply_texture_profile(
+                material,
+                source_textures,
+                color_size=job.texture_resolution,
+                data_size=job.texture_resolution,
+                sharpen=ULTRA_SHARPEN,
+                runtime=runtime,
+            )
+
+        _emit_progress(87, "Exporting lossless GLB")
+        glb_path = staging / "model.glb"
+        try:
+            mesh.export(str(glb_path), include_normals=True)
+        except Exception as exc:
+            raise WorkerError("glb-export", f"GLB export failed: {exc}") from exc
+
+        _emit_progress(90, "Validating lossless GLB")
         glb_info = _glb_metadata(glb_path)
+        if glb_info["images"] and glb_info["png_images"] != glb_info["images"]:
+            raise WorkerError(
+                "glb-texture-encoding",
+                "The exported GLB contains a texture that is not lossless PNG",
+            )
         glb_hash = _sha256(glb_path)
+
+        ultra_plus_info: dict[str, Any] | None = None
+        ultra_plus_hash: str | None = None
+        ultra_plus_error: str | None = None
+        ultra_plus_texture_info: dict[str, Any] | None = None
+        create_ultra_plus = (
+            job.texture_resolution == ULTRA_SOURCE_RESOLUTION
+            and (job.target == "unreal" or job.roblox_quality == "high")
+        )
+        ultra_plus_color_size = (
+            ULTRA_PLUS_TEXTURE_SIZE if job.target == "unreal" else ULTRA_TEXTURE_SIZE
+        )
+        ultra_plus_label = "Ultra+ 8K" if job.target == "unreal" else "Ultra+ 4K"
+        ultra_plus_name = (
+            "model_UltraPlus_8K.glb"
+            if job.target == "unreal"
+            else "model_UltraPlus_4K.glb"
+        )
+        ultra_plus_path = staging / ultra_plus_name
+        if create_ultra_plus:
+            _emit_progress(92, f"Creating optional {ultra_plus_label} texture")
+            try:
+                ultra_plus_texture_info = _apply_texture_profile(
+                    material,
+                    source_textures,
+                    color_size=ultra_plus_color_size,
+                    data_size=ULTRA_TEXTURE_SIZE,
+                    sharpen=ULTRA_PLUS_SHARPEN,
+                    runtime=runtime,
+                )
+                mesh.export(str(ultra_plus_path), include_normals=True)
+                ultra_plus_info = _glb_metadata(ultra_plus_path)
+                if (
+                    ultra_plus_info["images"]
+                    and ultra_plus_info["png_images"] != ultra_plus_info["images"]
+                ):
+                    raise WorkerError(
+                        "glb-texture-encoding",
+                        "The Ultra+ GLB contains a texture that is not lossless PNG",
+                    )
+                ultra_plus_hash = _sha256(ultra_plus_path)
+            except Exception as exc:
+                ultra_plus_error = _sanitize(exc, 300)
+                ultra_plus_path.unlink(missing_ok=True)
+                print(
+                    f"{ultra_plus_label} was skipped; the verified Ultra 4K model is ready: "
+                    + ultra_plus_error,
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                gc.collect()
+
+        _emit_progress(95, "Finalizing the verified asset")
         cuda_properties = torch.cuda.get_device_properties(torch.cuda.current_device())
 
         manifest: dict[str, Any] = {
@@ -844,6 +1078,17 @@ def _run_job(job: Job) -> Path:
                 "low_vram_mode": True,
                 "foreground_ratio": FOREGROUND_RATIO,
                 "seed": seed,
+                "texture_enhancement": {
+                    "profile": texture_profile,
+                    "gpu_bake_resolution": job.texture_resolution,
+                    "lossless_png": True,
+                    "textures": texture_info,
+                    "ultra_plus_requested": create_ultra_plus,
+                    "ultra_plus_created": ultra_plus_info is not None,
+                    "ultra_plus_profile": ultra_plus_label,
+                    "ultra_plus_error": ultra_plus_error,
+                    "ultra_plus_textures": ultra_plus_texture_info,
+                },
                 "remesh": {
                     "option": remesh_option,
                     "count_type": "vertex" if target_vertices is not None else "keep",
@@ -854,18 +1099,25 @@ def _run_job(job: Job) -> Path:
                 "glb": "model.glb",
                 "glb_sha256": glb_hash,
                 "glb_stats": glb_info,
+                "ultra_plus_glb": (
+                    ultra_plus_name if ultra_plus_info is not None else None
+                ),
+                "ultra_plus_glb_sha256": ultra_plus_hash,
+                "ultra_plus_glb_stats": ultra_plus_info,
                 "prepared_image": "input_prepared.png",
                 "points": "points.ply" if points_exported else None,
             },
         }
         _atomic_json(staging / "manifest.json", manifest)
 
-        _emit_progress(97, "Publishing the completed model")
+        _emit_progress(98, "Publishing the completed model")
         if final_dir.exists():
             raise WorkerError("output-conflict", "The final output directory already exists")
         staging.rename(final_dir)
         published = True
-        final_glb = final_dir / "model.glb"
+        final_glb = final_dir / (
+            ultra_plus_name if ultra_plus_info is not None else "model.glb"
+        )
         _emit_progress(100, "3D model completed")
         _emit_artifact(final_glb)
         return final_glb
@@ -889,6 +1141,9 @@ def _self_test() -> int:
         (FOREGROUND_RATIO == 1.3, "foreground ratio"),
         (TARGETS == {"roblox", "unreal"}, "targets"),
         (TEXTURE_RESOLUTIONS == {1024, 2048}, "texture resolutions"),
+        (ULTRA_SOURCE_RESOLUTION == 2048, "Ultra source resolution"),
+        (ULTRA_TEXTURE_SIZE == 4096, "Ultra texture size"),
+        (ULTRA_PLUS_TEXTURE_SIZE == 8192, "Ultra+ texture size"),
         (ROBLOX_VERTEX_TARGETS == {"balanced": 10_000, "high": 25_000}, "Roblox targets"),
         (VENDOR_ROOT == APP_ROOT / "vendor" / "stable-point-aware-3d", "vendor path"),
         (MODEL_ROOT == BUNDLE_ROOT / "models" / "spar3d", "model path"),
