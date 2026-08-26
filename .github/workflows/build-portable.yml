@@ -1,0 +1,89 @@
+name: Build Mujassam AI Portable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mujassam-portable-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows-portable:
+    name: Windows 2022 portable SPAR3D
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      RELEASE_TAG: portable-${{ github.run_number }}-${{ github.run_attempt }}
+      GH_PROMPT_DISABLED: "1"
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Select CPython 3.11.9
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11.9"
+          architecture: x64
+
+      - name: Validate gated-model token
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:HF_TOKEN)) {
+            throw "Repository secret HF_TOKEN is required. The token owner must accept the SPAR3D model terms first."
+          }
+
+      - name: Build portable application
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./build/build.ps1
+
+      - name: Verify published GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh release view $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --json assets,isDraft,tagName,url |
+            ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            throw "The GitHub Release could not be read after publication."
+          }
+          if ($release.isDraft -or $release.tagName -ne $env:RELEASE_TAG) {
+            throw "The GitHub Release was not published correctly."
+          }
+          $assetNames = @($release.assets | ForEach-Object { $_.name })
+          foreach ($required in @("Setup.exe", "release-manifest.json")) {
+            if ($required -notin $assetNames) {
+              throw "The published release is missing $required."
+            }
+          }
+          if (-not ($assetNames -like "runtime.zip.part*") -or
+              -not ($assetNames -like "model.safetensors.part*")) {
+            throw "The published release is missing runtime or model parts."
+          }
+          "Published: $($release.url)" | Out-File `
+            $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Publish build summary
+        shell: pwsh
+        run: |
+          @"
+          ## Mujassam AI portable build
+
+          - SPAR3D source: ``fdc311b16809e6a8adc2f5a3407ebb3db1a95bd1``
+          - Model revision: ``5699918cb34f55cd7d828493d2725f3038313761``
+          - Python: 3.11.9 application-local x64
+          - CUDA runtime: PyTorch cu124
+          - Release tag: ``${{ env.RELEASE_TAG }}``
+          - Distribution: Setup.exe + SHA-256-verified parts below 1.9 GB
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
