@@ -1,0 +1,404 @@
+name: Build Mujassam AI Studio quality update
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mujassam-studio-quality-v1
+  cancel-in-progress: false
+
+jobs:
+  build-studio-update:
+    name: Compile, test, and publish Studio quality update
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: studio-quality-v1
+      ARCHIVE_NAME: MujassamAI-Studio-Update-v1.zip
+      REALESRGAN_URL: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth
+      REALESRGAN_BYTES: "67061725"
+      REALESRGAN_SHA256: 49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Select CPython 3.11.9
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11.9"
+          architecture: x64
+
+      - name: Compile and test Python quality engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          python -m py_compile `
+              app/worker.py `
+              app/quality/__init__.py `
+              app/quality/__main__.py `
+              app/quality/realesrgan_x2.py
+          python app/worker.py --self-test
+
+          # The portable app already contains CUDA PyTorch.  CI installs the
+          # official CPU wheel only to exercise the quality code safely on the
+          # GitHub-hosted runner; it is not copied into the update ZIP.
+          python -m pip install --disable-pip-version-check `
+              --only-binary=:all: numpy==1.26.4 Pillow==10.4.0
+          python -m pip install --disable-pip-version-check `
+              --only-binary=:all: `
+              --index-url https://download.pytorch.org/whl/cpu `
+              torch==2.5.1
+          # Match the real GUI launch: isolated Python must still locate only
+          # the application-owned quality package.
+          python -I -X utf8 app/worker.py --quality-self-test
+
+      - name: Download and verify official Real-ESRGAN model
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $ModelDirectory = Join-Path $env:RUNNER_TEMP "official-model"
+          $ModelPath = Join-Path $ModelDirectory "RealESRGAN_x2plus.pth"
+          New-Item -ItemType Directory -Path $ModelDirectory -Force | Out-Null
+
+          & curl.exe --fail --location --retry 8 --retry-delay 3 `
+              --retry-all-errors --output $ModelPath $env:REALESRGAN_URL
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to download the official Real-ESRGAN x2plus model"
+          }
+
+          $Model = Get-Item $ModelPath
+          if ($Model.Length -ne [Int64]$env:REALESRGAN_BYTES) {
+              throw "Real-ESRGAN byte count mismatch: $($Model.Length)"
+          }
+          $Digest = (Get-FileHash $ModelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($Digest -cne $env:REALESRGAN_SHA256) {
+              throw "Real-ESRGAN SHA-256 mismatch: $Digest"
+          }
+
+          # This loads the verified params_ema mapping strictly into the local
+          # RRDBNet implementation.  It catches architecture/checkpoint drift,
+          # while inference tiling is covered by the model-free self-test.
+          $env:MUJASSAM_CI_MODEL = $ModelPath
+          @'
+          import os
+          from app.quality import load_realesrgan_x2plus, verify_weight_file
+
+          path = verify_weight_file(os.environ["MUJASSAM_CI_MODEL"])
+          runner = load_realesrgan_x2plus(path, device="cpu", half=False)
+          runner.close()
+          print("Official Real-ESRGAN checkpoint: OK")
+          '@ | python -
+
+      - name: Compile MujassamAI.exe and stage root-layout update
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $BuildRoot = Join-Path $env:RUNNER_TEMP "mujassam-studio-update"
+          $Stage = Join-Path $BuildRoot "stage"
+          $GuiTestRoot = Join-Path $BuildRoot "gui-self-test"
+          $Output = Join-Path $BuildRoot "output"
+          New-Item -ItemType Directory -Path $Stage, $GuiTestRoot, $Output -Force | Out-Null
+
+          $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $VsInstall = & $VsWhere -latest -products * `
+              -requires Microsoft.Component.MSBuild -property installationPath
+          if ([string]::IsNullOrWhiteSpace($VsInstall)) {
+              throw "Visual Studio 2022 was not found"
+          }
+          $Csc = Join-Path $VsInstall "MSBuild\Current\Bin\Roslyn\csc.exe"
+          $ReferenceRoot = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8"
+          if (-not (Test-Path $Csc -PathType Leaf) -or
+              -not (Test-Path $ReferenceRoot -PathType Container)) {
+              throw ".NET Framework 4.8 compiler/reference assemblies were not found"
+          }
+
+          $AppManifest = Join-Path $BuildRoot "MujassamAI.manifest"
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+            <assemblyIdentity version="1.0.0.0" name="MujassamAI.Portable" />
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+              <security><requestedPrivileges>
+                <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+              </requestedPrivileges></security>
+            </trustInfo>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3">
+              <windowsSettings>
+                <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+              </windowsSettings>
+            </application>
+            <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+              <application>
+                <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+              </application>
+            </compatibility>
+            <dependency><dependentAssembly>
+              <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                version="6.0.0.0" processorArchitecture="*"
+                publicKeyToken="6595b64144ccf1df" language="*" />
+            </dependentAssembly></dependency>
+          </assembly>
+          '@ | Set-Content $AppManifest -Encoding utf8
+
+          $ReferenceNames = @(
+              "System.dll",
+              "System.Core.dll",
+              "System.Drawing.dll",
+              "System.Web.Extensions.dll",
+              "System.Windows.Forms.dll"
+          )
+          $References = @($ReferenceNames | ForEach-Object {
+              $ReferencePath = Join-Path $ReferenceRoot $_
+              if (-not (Test-Path $ReferencePath -PathType Leaf)) {
+                  throw "Missing reference assembly: $ReferencePath"
+              }
+              "/reference:$ReferencePath"
+          })
+
+          $Executable = Join-Path $Stage "MujassamAI.exe"
+          $CscArguments = @(
+              "/nologo",
+              "/noconfig",
+              "/target:winexe",
+              "/platform:x64",
+              "/optimize+",
+              "/debug-",
+              "/langversion:latest",
+              "/win32manifest:$AppManifest",
+              "/out:$Executable"
+          ) + $References + @(
+              (Join-Path $env:GITHUB_WORKSPACE "app\Program.cs"),
+              (Join-Path $env:GITHUB_WORKSPACE "app\MainForm.cs")
+          )
+          & $Csc @CscArguments
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Executable -PathType Leaf)) {
+              throw "MujassamAI.exe compilation failed"
+          }
+
+          New-Item -ItemType Directory -Path `
+              (Join-Path $Stage "app\quality"), `
+              (Join-Path $Stage "models\realesrgan"), `
+              (Join-Path $Stage "licenses") -Force | Out-Null
+          Copy-Item app/worker.py (Join-Path $Stage "app\worker.py")
+          Copy-Item app/quality/*.py (Join-Path $Stage "app\quality")
+          Copy-Item app/quality/models.json (Join-Path $Stage "app\quality\models.json")
+          Copy-Item licenses/* (Join-Path $Stage "licenses") -Recurse
+          Copy-Item `
+              (Join-Path $env:RUNNER_TEMP "official-model\RealESRGAN_x2plus.pth") `
+              (Join-Path $Stage "models\realesrgan\RealESRGAN_x2plus.pth")
+
+          # Validate the GUI in a fake complete layout.  The dummy runtime is
+          # deliberately outside Stage, so it can never overwrite the real
+          # application-local Python when this update is extracted.
+          New-Item -ItemType Directory -Path `
+              (Join-Path $GuiTestRoot "app\quality"), `
+              (Join-Path $GuiTestRoot "models\realesrgan"), `
+              (Join-Path $GuiTestRoot "rt") -Force | Out-Null
+          Copy-Item $Executable (Join-Path $GuiTestRoot "MujassamAI.exe")
+          Copy-Item app/worker.py (Join-Path $GuiTestRoot "app\worker.py")
+          Copy-Item app/quality/* (Join-Path $GuiTestRoot "app\quality") -Recurse
+          Copy-Item `
+              (Join-Path $env:RUNNER_TEMP "official-model\RealESRGAN_x2plus.pth") `
+              (Join-Path $GuiTestRoot "models\realesrgan\RealESRGAN_x2plus.pth")
+          New-Item -ItemType File -Path (Join-Path $GuiTestRoot "rt\python.exe") -Force | Out-Null
+          $GuiReport = Join-Path $GuiTestRoot "self-test.txt"
+          $GuiProcess = Start-Process `
+              -FilePath (Join-Path $GuiTestRoot "MujassamAI.exe") `
+              -ArgumentList @("--self-test", $GuiReport) -Wait -PassThru
+          if ($GuiProcess.ExitCode -ne 0 -or -not (Test-Path $GuiReport -PathType Leaf)) {
+              throw "MujassamAI.exe self-test failed with exit code $($GuiProcess.ExitCode)"
+          }
+          $GuiReportText = Get-Content $GuiReport -Raw
+          if (-not $GuiReportText.Contains("PortableLayout=OK") -or
+              -not $GuiReportText.Contains("JobSchemaVersion=2") -or
+              -not $GuiReportText.Contains("JobSchema=OK") -or
+              -not $GuiReportText.Contains("Is64BitProcess=True")) {
+              Write-Host $GuiReportText
+              throw "MujassamAI.exe self-test reported an invalid staged layout/schema"
+          }
+
+          $RequiredFiles = @(
+              "MujassamAI.exe",
+              "app/worker.py",
+              "app/quality/__init__.py",
+              "app/quality/__main__.py",
+              "app/quality/realesrgan_x2.py",
+              "app/quality/models.json",
+              "models/realesrgan/RealESRGAN_x2plus.pth",
+              "licenses/Real-ESRGAN-BSD-3-Clause.txt",
+              "licenses/BasicSR-Apache-2.0.txt"
+          )
+          foreach ($RelativePath in $RequiredFiles) {
+              $NativeRelativePath = $RelativePath.Replace(
+                  [char]'/', [System.IO.Path]::DirectorySeparatorChar)
+              $NativePath = Join-Path $Stage $NativeRelativePath
+              if (-not (Test-Path $NativePath -PathType Leaf)) {
+                  throw "Staged update is missing $RelativePath"
+              }
+          }
+
+          $Entries = @(Get-ChildItem $Stage -Recurse -File | Sort-Object FullName | ForEach-Object {
+              $RelativePath = $_.FullName.Substring($Stage.Length)
+              $RelativePath = $RelativePath.TrimStart(
+                  [System.IO.Path]::DirectorySeparatorChar)
+              $RelativePath = $RelativePath.Replace(
+                  [System.IO.Path]::DirectorySeparatorChar, [char]'/')
+              [ordered]@{
+                  path = $RelativePath
+                  bytes = [Int64]$_.Length
+                  sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              }
+          })
+          $Manifest = [ordered]@{
+              schema_version = 1
+              release_tag = $env:RELEASE_TAG
+              artifact = $env:ARCHIVE_NAME
+              source_commit = $env:GITHUB_SHA
+              files = $Entries
+          }
+          $ManifestPath = Join-Path $Stage "update-manifest.json"
+          $Manifest | ConvertTo-Json -Depth 6 | Set-Content $ManifestPath -Encoding utf8
+
+          $Archive = Join-Path $Output $env:ARCHIVE_NAME
+          Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $Archive -CompressionLevel Optimal
+          if (-not (Test-Path $Archive -PathType Leaf)) {
+              throw "Update archive was not created"
+          }
+
+          "MUJASSAM_STAGE=$Stage" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "MUJASSAM_ARCHIVE=$Archive" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify ZIP manifest after clean extraction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $VerifyRoot = Join-Path $env:RUNNER_TEMP "mujassam-update-verify"
+          if (Test-Path $VerifyRoot) {
+              Remove-Item $VerifyRoot -Recurse -Force
+          }
+          Expand-Archive -Path $env:MUJASSAM_ARCHIVE -DestinationPath $VerifyRoot
+
+          $ManifestPath = Join-Path $VerifyRoot "update-manifest.json"
+          if (-not (Test-Path $ManifestPath -PathType Leaf)) {
+              throw "Extracted ZIP is missing update-manifest.json"
+          }
+          $Manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+          if ($Manifest.schema_version -ne 1 -or
+              $Manifest.release_tag -ne $env:RELEASE_TAG -or
+              $Manifest.artifact -ne $env:ARCHIVE_NAME) {
+              throw "Extracted update manifest metadata is invalid"
+          }
+
+          $ExpectedPaths = @($Manifest.files | ForEach-Object { [string]$_.path })
+          $ActualPaths = @(Get-ChildItem $VerifyRoot -Recurse -File |
+              Where-Object { $_.FullName -ne $ManifestPath } |
+              ForEach-Object {
+                  $RelativePath = $_.FullName.Substring($VerifyRoot.Length)
+                  $RelativePath = $RelativePath.TrimStart(
+                      [System.IO.Path]::DirectorySeparatorChar)
+                  $RelativePath.Replace(
+                      [System.IO.Path]::DirectorySeparatorChar, [char]'/')
+              } | Sort-Object)
+          $SortedExpectedPaths = @($ExpectedPaths | Sort-Object)
+          if (($ActualPaths -join "`n") -cne ($SortedExpectedPaths -join "`n")) {
+              throw "Extracted ZIP file list does not match update-manifest.json"
+          }
+
+          foreach ($Entry in $Manifest.files) {
+              if ([string]$Entry.path -notmatch '^[A-Za-z0-9_. /+-]+$' -or
+                  [string]$Entry.path -match '(^|/)\.\.(/|$)') {
+                  throw "Unsafe path in update manifest: $($Entry.path)"
+              }
+              $NativeRelativePath = ([string]$Entry.path).Replace(
+                  [char]'/', [System.IO.Path]::DirectorySeparatorChar)
+              $FilePath = Join-Path $VerifyRoot $NativeRelativePath
+              $File = Get-Item $FilePath
+              if ($File.Length -ne [Int64]$Entry.bytes) {
+                  throw "Size mismatch after extraction: $($Entry.path)"
+              }
+              $Digest = (Get-FileHash $FilePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($Digest -cne [string]$Entry.sha256) {
+                  throw "SHA-256 mismatch after extraction: $($Entry.path)"
+              }
+          }
+
+          $Model = Join-Path $VerifyRoot "models\realesrgan\RealESRGAN_x2plus.pth"
+          if ((Get-Item $Model).Length -ne [Int64]$env:REALESRGAN_BYTES -or
+              (Get-FileHash $Model -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:REALESRGAN_SHA256) {
+              throw "The extracted official model failed its pinned verification"
+          }
+          Write-Host "Verified $($Manifest.files.Count) update files after clean extraction"
+
+      - name: Publish or update GitHub Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $Notes = @"
+          Mujassam AI Studio quality update v1.
+
+          Extract this root-layout ZIP over the existing MujassamAI-Portable folder while the app is closed. It updates the single MujassamAI.exe interface, worker, AI texture-quality module, official verified Real-ESRGAN x2plus weights, and licenses. It does not replace the bundled Python runtime or SPAR3D model.
+
+          RealESRGAN_x2plus.pth is pinned to 67,061,725 bytes and SHA-256 $($env:REALESRGAN_SHA256).
+          "@
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          $ReleaseExists = $LASTEXITCODE -eq 0
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($ReleaseExists) {
+              gh release edit $env:RELEASE_TAG `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --title "Mujassam AI Studio Quality v1" `
+                  --notes $Notes `
+                  --draft=false `
+                  --prerelease=false
+              gh release upload $env:RELEASE_TAG $env:MUJASSAM_ARCHIVE `
+                  --repo $env:GITHUB_REPOSITORY --clobber
+          }
+          else {
+              gh release create $env:RELEASE_TAG $env:MUJASSAM_ARCHIVE `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --target $env:GITHUB_SHA `
+                  --title "Mujassam AI Studio Quality v1" `
+                  --notes $Notes
+          }
+
+          $PublishedDirectory = Join-Path $env:RUNNER_TEMP "published-update"
+          New-Item -ItemType Directory -Path $PublishedDirectory -Force | Out-Null
+          gh release download $env:RELEASE_TAG `
+              --repo $env:GITHUB_REPOSITORY `
+              --pattern $env:ARCHIVE_NAME `
+              --dir $PublishedDirectory
+          $PublishedArchive = Join-Path $PublishedDirectory $env:ARCHIVE_NAME
+          $LocalDigest = (Get-FileHash $env:MUJASSAM_ARCHIVE -Algorithm SHA256).Hash
+          $PublishedDigest = (Get-FileHash $PublishedArchive -Algorithm SHA256).Hash
+          if ($LocalDigest -cne $PublishedDigest) {
+              throw "Published update ZIP does not match the verified local archive"
+          }
+
+          $ReleaseUrl = gh release view $env:RELEASE_TAG `
+              --repo $env:GITHUB_REPOSITORY --json url --jq .url
+          @"
+          ## Mujassam AI Studio quality update
+
+          - Release: [$($env:RELEASE_TAG)]($ReleaseUrl)
+          - ZIP: ``$($env:ARCHIVE_NAME)``
+          - ZIP SHA-256: ``$($LocalDigest.ToLowerInvariant())``
+          - Official Real-ESRGAN model SHA-256: ``$($env:REALESRGAN_SHA256)``
+          - GUI self-test: passed
+          - Worker and AI texture-quality tests: passed
+          - Extracted file manifest verification: passed
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

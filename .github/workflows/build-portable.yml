@@ -84,6 +84,7 @@ jobs:
           - Model revision: ``5699918cb34f55cd7d828493d2725f3038313761``
           - Python: 3.11.9 application-local x64
           - CUDA runtime: PyTorch cu124
+          - CUDA extensions: SM 7.5 / 8.0 / 8.6 / 8.9 + PTX
           - Release tag: ``${{ env.RELEASE_TAG }}``
           - Distribution: Setup.exe + SHA-256-verified parts below 1.9 GB
           "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

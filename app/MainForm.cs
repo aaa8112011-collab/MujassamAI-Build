@@ -20,14 +20,28 @@ namespace MujassamPortable
         private const string ArtifactPrefix = "MJARTIFACT|";
         private const string ErrorPrefix = "MJERROR|";
         private const int MaximumLogCharacters = 240000;
+        internal const int JobSchemaVersion = 2;
+
+        private const string TargetRoblox = "roblox";
+        private const string TargetUnreal = "unreal";
+        private const string TextureNative2K = "native_2k";
+        private const string TextureAiStudio4K = "ai_4k";
+        private const string TextureAiStudio8K = "export_8k";
+        private const string HardwareAuto = "auto";
+        private const string Hardware8Gb = "vram_8gb";
+        private const string Hardware16GbPlus = "vram_16gb_plus";
+        private const string GeometryRobloxGameReady = "target_ready";
+        private const string GeometryRobloxMaster = "max_detail";
+        private const string GeometryUnrealOriginal = "original";
 
         private readonly TextBox imagePathBox;
         private readonly TextBox outputPathBox;
         private readonly PictureBox imagePreview;
         private readonly ComboBox targetBox;
         private readonly ComboBox textureBox;
-        private readonly ComboBox robloxQualityBox;
-        private readonly Label robloxQualityLabel;
+        private readonly ComboBox hardwareBox;
+        private readonly ComboBox geometryBox;
+        private readonly Label optionsHint;
         private readonly Button browseImageButton;
         private readonly Button browseOutputButton;
         private readonly Button generateButton;
@@ -64,8 +78,9 @@ namespace MujassamPortable
             imagePreview = new PictureBox();
             targetBox = CreateDropDown();
             textureBox = CreateDropDown();
-            robloxQualityBox = CreateDropDown();
-            robloxQualityLabel = CreateFieldLabel("جودة Roblox");
+            hardwareBox = CreateDropDown();
+            geometryBox = CreateDropDown();
+            optionsHint = new Label();
             browseImageButton = CreateSecondaryButton("اختيار صورة...");
             browseOutputButton = CreateSecondaryButton("اختيار مجلد...");
             generateButton = CreatePrimaryButton("إنشاء المجسم");
@@ -152,7 +167,7 @@ namespace MujassamPortable
             };
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 122));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 158));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 65));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 53));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 165));
@@ -267,34 +282,31 @@ namespace MujassamPortable
             {
                 Dock = DockStyle.Fill,
                 Padding = new Padding(13, 10, 13, 9),
-                ColumnCount = 6,
-                RowCount = 2
+                ColumnCount = 4,
+                RowCount = 3
             };
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 94));
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 108));
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33F));
+            options.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
+            options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
             options.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
-            options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34F));
-            options.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+            options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            options.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
+            options.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
             options.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             options.Controls.Add(CreateFieldLabel("الهدف"), 0, 0);
             options.Controls.Add(targetBox, 1, 0);
-            options.Controls.Add(CreateFieldLabel("دقة الخامة"), 2, 0);
-            options.Controls.Add(textureBox, 3, 0);
-            options.Controls.Add(robloxQualityLabel, 4, 0);
-            options.Controls.Add(robloxQualityBox, 5, 0);
-            Label optionsHint = new Label
-            {
-                Text = "1024 أخف وأسرع. استخدم 2048 عند توفر VRAM كافية. جودة Roblox تتحكم في كثافة المجسم النهائي.",
-                Dock = DockStyle.Fill,
-                ForeColor = Color.FromArgb(91, 101, 116),
-                TextAlign = ContentAlignment.MiddleRight,
-                AutoEllipsis = true,
-                Padding = new Padding(4, 3, 4, 0)
-            };
-            options.SetColumnSpan(optionsHint, 5);
-            options.Controls.Add(optionsHint, 1, 1);
+            options.Controls.Add(CreateFieldLabel("قدرة الجهاز"), 2, 0);
+            options.Controls.Add(hardwareBox, 3, 0);
+            options.Controls.Add(CreateFieldLabel("دقة الخامة"), 0, 1);
+            options.Controls.Add(textureBox, 1, 1);
+            options.Controls.Add(CreateFieldLabel("الهندسة"), 2, 1);
+            options.Controls.Add(geometryBox, 3, 1);
+            optionsHint.Dock = DockStyle.Fill;
+            optionsHint.ForeColor = Color.FromArgb(91, 101, 116);
+            optionsHint.TextAlign = ContentAlignment.MiddleRight;
+            optionsHint.AutoEllipsis = true;
+            optionsHint.Padding = new Padding(4, 4, 4, 0);
+            options.SetColumnSpan(optionsHint, 4);
+            options.Controls.Add(optionsHint, 0, 2);
             optionsCard.Controls.Add(options);
             root.Controls.Add(optionsCard, 0, 2);
 
@@ -369,13 +381,10 @@ namespace MujassamPortable
             targetBox.Items.Add("Unreal Engine");
             targetBox.SelectedIndex = 0;
 
-            textureBox.Items.Add("1024 × 1024 — موصى به");
-            textureBox.Items.Add("2048 × 2048 — تفاصيل أعلى");
-            textureBox.SelectedIndex = 0;
-
-            robloxQualityBox.Items.Add("متوازن — أداء أفضل");
-            robloxQualityBox.Items.Add("عالي — تفاصيل أكثر");
-            robloxQualityBox.SelectedIndex = 0;
+            hardwareBox.Items.Add("Auto — يكتشف الجهاز تلقائيًا");
+            hardwareBox.Items.Add("8GB VRAM — وضع آمن");
+            hardwareBox.Items.Add("16GB+ VRAM — معالجة أثقل و8K");
+            hardwareBox.SelectedIndex = 0;
         }
 
         private void WireEvents()
@@ -386,6 +395,9 @@ namespace MujassamPortable
             cancelButton.Click += CancelGeneration;
             openResultButton.Click += OpenResult;
             targetBox.SelectedIndexChanged += delegate { UpdateTargetControls(); };
+            textureBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
+            hardwareBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
+            geometryBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
             imagePathBox.TextChanged += delegate { TryLoadPreview(imagePathBox.Text); };
             FormClosing += OnMainFormClosing;
             FormClosed += OnMainFormClosed;
@@ -402,8 +414,73 @@ namespace MujassamPortable
         private void UpdateTargetControls()
         {
             bool roblox = targetBox.SelectedIndex == 0;
-            robloxQualityBox.Enabled = roblox && workerProcess == null;
-            robloxQualityLabel.Enabled = roblox;
+            int previousTexture = textureBox.SelectedIndex;
+
+            textureBox.BeginUpdate();
+            textureBox.Items.Clear();
+            textureBox.Items.Add("Native 2K — أصلي وأسرع");
+            textureBox.Items.Add("AI Studio 4K — موصى به");
+            if (!roblox)
+                textureBox.Items.Add("AI Studio 8K — Unreal فقط");
+            textureBox.SelectedIndex = previousTexture >= 0 && previousTexture < textureBox.Items.Count
+                ? previousTexture
+                : 1;
+            textureBox.EndUpdate();
+
+            geometryBox.BeginUpdate();
+            geometryBox.Items.Clear();
+            if (roblox)
+            {
+                geometryBox.Items.Add("Game-ready — جاهز للعبة");
+                geometryBox.Items.Add("Master — أعلى تفاصيل");
+            }
+            else
+            {
+                geometryBox.Items.Add("Original — كامل التفاصيل");
+            }
+            geometryBox.SelectedIndex = 0;
+            geometryBox.EndUpdate();
+
+            bool idle = workerProcess == null;
+            textureBox.Enabled = idle;
+            geometryBox.Enabled = idle;
+            UpdateOptionsHint();
+        }
+
+        private void UpdateOptionsHint()
+        {
+            if (targetBox.SelectedIndex < 0 || textureBox.SelectedIndex < 0 ||
+                hardwareBox.SelectedIndex < 0 || geometryBox.SelectedIndex < 0)
+            {
+                optionsHint.Text = String.Empty;
+                return;
+            }
+
+            string hardwareHint;
+            if (hardwareBox.SelectedIndex == 1)
+                hardwareHint = "8GB يشغّل وضع الذاكرة المنخفضة";
+            else if (hardwareBox.SelectedIndex == 2)
+                hardwareHint = "16GB+ يفتح الوضع الكامل وتصدير 8K على الجهاز الأقوى";
+            else
+                hardwareHint = "Auto يفحص VRAM ويختار الوضع المناسب";
+
+            string textureHint;
+            if (textureBox.SelectedIndex == 0)
+                textureHint = "Native 2K أسرع بلا ترميم AI";
+            else if (textureBox.SelectedIndex == 2)
+                textureHint = "AI 8K مخصص لتصدير Unreal ويحتاج وقتًا وذاكرة أكثر";
+            else
+                textureHint = "AI Studio 4K يرمم الخامة وهو الخيار الموصى به";
+
+            string geometryHint;
+            if (targetBox.SelectedIndex == 1)
+                geometryHint = "Unreal Original يحافظ على المجسم الكامل";
+            else if (geometryBox.SelectedIndex == 1)
+                geometryHint = "Roblox Master يحفظ أعلى تفاصيل وقد يحتاج تقليلًا قبل النشر";
+            else
+                geometryHint = "Roblox Game-ready أخف وجاهز للاستخدام";
+
+            optionsHint.Text = hardwareHint + " • " + textureHint + " • " + geometryHint + ".";
         }
 
         private void BrowseImage(object sender, EventArgs e)
@@ -522,16 +599,13 @@ namespace MujassamPortable
 
         private string WriteJobFile(string imagePath, string outputDirectory)
         {
-            string target = targetBox.SelectedIndex == 0 ? "roblox" : "unreal";
-            int textureResolution = textureBox.SelectedIndex == 1 ? 2048 : 1024;
-            string robloxQuality = robloxQualityBox.SelectedIndex == 1 ? "high" : "balanced";
-            Dictionary<string, object> job = new Dictionary<string, object>();
-            job["schema_version"] = 1;
-            job["image_path"] = imagePath;
-            job["output_dir"] = outputDirectory;
-            job["target"] = target;
-            job["texture_resolution"] = textureResolution;
-            job["roblox_quality"] = robloxQuality;
+            Dictionary<string, object> job = CreateJobPayload(
+                imagePath,
+                outputDirectory,
+                targetBox.SelectedIndex,
+                textureBox.SelectedIndex,
+                hardwareBox.SelectedIndex,
+                geometryBox.SelectedIndex);
 
             string jobsDirectory = Path.Combine(Path.GetTempPath(), "MujassamPortable", "jobs");
             Directory.CreateDirectory(jobsDirectory);
@@ -547,6 +621,75 @@ namespace MujassamPortable
             return finalPath;
         }
 
+        internal static Dictionary<string, object> CreateJobPayload(
+            string imagePath,
+            string outputDirectory,
+            int targetIndex,
+            int textureIndex,
+            int hardwareIndex,
+            int geometryIndex)
+        {
+            string target = targetIndex == 0 ? TargetRoblox : TargetUnreal;
+            string textureMode;
+            if (textureIndex == 0)
+                textureMode = TextureNative2K;
+            else if (textureIndex == 2 && target == TargetUnreal)
+                textureMode = TextureAiStudio8K;
+            else
+                textureMode = TextureAiStudio4K;
+
+            string hardwarePreset;
+            if (hardwareIndex == 1)
+                hardwarePreset = Hardware8Gb;
+            else if (hardwareIndex == 2)
+                hardwarePreset = Hardware16GbPlus;
+            else
+                hardwarePreset = HardwareAuto;
+
+            string geometryMode;
+            if (target == TargetUnreal)
+                geometryMode = GeometryUnrealOriginal;
+            else if (geometryIndex == 1)
+                geometryMode = GeometryRobloxMaster;
+            else
+                geometryMode = GeometryRobloxGameReady;
+
+            Dictionary<string, object> job = new Dictionary<string, object>();
+            job["schema_version"] = JobSchemaVersion;
+            job["image_path"] = imagePath;
+            job["output_dir"] = outputDirectory;
+            job["target"] = target;
+            job["texture_mode"] = textureMode;
+            job["hardware_preset"] = hardwarePreset;
+            job["geometry_mode"] = geometryMode;
+            return job;
+        }
+
+        internal static string ValidateConfigurationSchema()
+        {
+            Dictionary<string, object> roblox = CreateJobPayload(
+                "input.png", "output", 0, 1, 0, 1);
+            if (!Object.Equals(roblox["schema_version"], JobSchemaVersion) ||
+                !Object.Equals(roblox["target"], TargetRoblox) ||
+                !Object.Equals(roblox["texture_mode"], TextureAiStudio4K) ||
+                !Object.Equals(roblox["hardware_preset"], HardwareAuto) ||
+                !Object.Equals(roblox["geometry_mode"], GeometryRobloxMaster))
+                return "Roblox schema mapping failed.";
+
+            Dictionary<string, object> unreal = CreateJobPayload(
+                "input.png", "output", 1, 2, 2, 0);
+            if (!Object.Equals(unreal["schema_version"], JobSchemaVersion) ||
+                !Object.Equals(unreal["target"], TargetUnreal) ||
+                !Object.Equals(unreal["texture_mode"], TextureAiStudio8K) ||
+                !Object.Equals(unreal["hardware_preset"], Hardware16GbPlus) ||
+                !Object.Equals(unreal["geometry_mode"], GeometryUnrealOriginal))
+                return "Unreal schema mapping failed.";
+
+            if (roblox.Count != 7 || unreal.Count != 7)
+                return "Unexpected job schema field count.";
+            return String.Empty;
+        }
+
         private void BeginWorker(string pythonPath, string workerPath, string jobPath, string outputDirectory)
         {
             resultArtifactPath = null;
@@ -559,6 +702,8 @@ namespace MujassamPortable
             logBox.Clear();
             AppendLog("الصورة: " + imagePathBox.Text);
             AppendLog("الإخراج: " + outputDirectory);
+            AppendLog("الهدف: " + targetBox.Text);
+            AppendLog("الإعدادات: " + hardwareBox.Text + " | " + textureBox.Text + " | " + geometryBox.Text);
             AppendLog("بدء محرك 3D المحلي...");
 
             ProcessStartInfo start = new ProcessStartInfo();
@@ -874,12 +1019,12 @@ namespace MujassamPortable
             browseOutputButton.Enabled = !running;
             targetBox.Enabled = !running;
             textureBox.Enabled = !running;
+            hardwareBox.Enabled = !running;
+            geometryBox.Enabled = !running;
             generateButton.Enabled = !running;
             cancelButton.Enabled = running;
             openResultButton.Enabled = !running && !String.IsNullOrWhiteSpace(resultArtifactPath) &&
                 (File.Exists(resultArtifactPath) || Directory.Exists(resultArtifactPath));
-            robloxQualityBox.Enabled = !running && targetBox.SelectedIndex == 0;
-            robloxQualityLabel.Enabled = targetBox.SelectedIndex == 0;
         }
 
         private void ShowInputError(string message)
@@ -1029,11 +1174,17 @@ namespace MujassamPortable
             string root = AppDomain.CurrentDomain.BaseDirectory;
             string python = Path.Combine(root, "rt", "python.exe");
             string worker = Path.Combine(root, "app", "worker.py");
+            string quality = Path.Combine(root, "app", "quality", "realesrgan_x2.py");
+            string aiModel = Path.Combine(root, "models", "realesrgan", "RealESRGAN_x2plus.pth");
             List<string> missing = new List<string>();
             if (!File.Exists(python))
                 missing.Add(python);
             if (!File.Exists(worker))
                 missing.Add(worker);
+            if (!File.Exists(quality))
+                missing.Add(quality);
+            if (!File.Exists(aiModel))
+                missing.Add(aiModel);
             return missing.Count == 0 ? String.Empty : String.Join(Environment.NewLine, missing.ToArray());
         }
 

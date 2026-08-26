@@ -15,6 +15,7 @@ import gc
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import struct
@@ -27,31 +28,31 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = {1, 2}
 FOREGROUND_RATIO = 1.3
 MAX_JOB_BYTES = 256 * 1024
 MAX_IMAGE_BYTES = 200 * 1024 * 1024
 MAX_IMAGE_PIXELS = 100_000_000
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
-TEXTURE_RESOLUTIONS = {1024, 2048}
 TARGETS = {"roblox", "unreal"}
-ROBLOX_VERTEX_TARGETS = {"balanced": 10_000, "high": 25_000}
-
-# SPAR3D's pinned exporter marks its baked textures as JPEG. Trimesh then
-# recompresses them while writing the GLB, which visibly damages fine detail.
-# Keep SPAR3D's GPU bake capped at 2K for 8 GB cards, then create lossless
-# display textures on CPU. Ultra+ stays at Roblox's 4K limit with stronger
-# detail enhancement, while Unreal gets an optional 8K color map and 4K normal.
-ULTRA_SOURCE_RESOLUTION = 2048
-ULTRA_TEXTURE_SIZE = 4096
-ULTRA_PLUS_TEXTURE_SIZE = 8192
-ULTRA_SHARPEN = {"radius": 1.15, "percent": 110, "threshold": 2}
-ULTRA_PLUS_SHARPEN = {"radius": 1.35, "percent": 145, "threshold": 2}
+TEXTURE_MODES = {
+    "native_1k": 1024,  # legacy launcher compatibility only
+    "native_2k": 2048,
+    "ai_4k": 4096,
+    "export_8k": 8192,
+}
+HARDWARE_PRESETS = {"auto", "vram_8gb", "vram_16gb_plus"}
+GEOMETRY_MODES = {"target_ready", "max_detail", "original"}
+ROBLOX_READY_VERTEX_TARGET = 9_500
+SPAR_BAKE_RESOLUTION = 2048
+HIGH_VRAM_THRESHOLD_BYTES = 12 * 1024**3
 
 APP_ROOT = Path(__file__).resolve().parent
 BUNDLE_ROOT = APP_ROOT.parent.resolve()
 VENDOR_ROOT = APP_ROOT / "vendor" / "stable-point-aware-3d"
 MODEL_ROOT = BUNDLE_ROOT / "models" / "spar3d"
+AI_TEXTURE_MODEL = BUNDLE_ROOT / "models" / "realesrgan" / "RealESRGAN_x2plus.pth"
 BACKGROUND_CHECKPOINT = (
     BUNDLE_ROOT / "models" / "transparent-background" / "ckpt_base.pth"
 )
@@ -102,8 +103,10 @@ class Job:
     image_path: Path
     output_dir: Path
     target: str
-    texture_resolution: int
-    roblox_quality: str
+    texture_mode: str
+    geometry_mode: str
+    hardware_preset: str
+    source_schema_version: int
 
 
 @dataclass(frozen=True)
@@ -284,14 +287,18 @@ def _validate_output_root(value: str) -> Path:
 
 
 def _parse_job(payload: dict[str, Any]) -> Job:
-    required = {
-        "schema_version",
-        "image_path",
-        "output_dir",
-        "target",
-        "texture_resolution",
-        "roblox_quality",
-    }
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise WorkerError(
+            "schema-version",
+            f"schema_version must be one of {sorted(SUPPORTED_SCHEMA_VERSIONS)}",
+        )
+
+    common = {"schema_version", "image_path", "output_dir", "target"}
+    if schema_version == 1:
+        required = common | {"texture_resolution", "roblox_quality"}
+    else:
+        required = common | {"texture_mode", "geometry_mode", "hardware_preset"}
     missing = sorted(required - payload.keys())
     unknown = sorted(payload.keys() - required)
     if missing:
@@ -299,32 +306,63 @@ def _parse_job(payload: dict[str, Any]) -> Job:
     if unknown:
         raise WorkerError("request-schema", f"Unknown properties: {', '.join(unknown)}")
 
-    schema_version = payload["schema_version"]
-    if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
-        raise WorkerError(
-            "schema-version", f"schema_version must be {SCHEMA_VERSION}"
-        )
-
     target = _require_string(payload, "target")
     if target not in TARGETS:
         raise WorkerError("request-schema", "target must be 'roblox' or 'unreal'")
 
-    texture_resolution = payload["texture_resolution"]
-    if type(texture_resolution) is not int or texture_resolution not in TEXTURE_RESOLUTIONS:
-        raise WorkerError("request-schema", "texture_resolution must be 1024 or 2048")
+    if schema_version == 1:
+        texture_resolution = payload["texture_resolution"]
+        if type(texture_resolution) is not int or texture_resolution not in {1024, 2048}:
+            raise WorkerError(
+                "request-schema", "texture_resolution must be 1024 or 2048"
+            )
+        roblox_quality = _require_string(payload, "roblox_quality")
+        if roblox_quality not in {"balanced", "high"}:
+            raise WorkerError(
+                "request-schema", "roblox_quality must be 'balanced' or 'high'"
+            )
+        texture_mode = "native_1k" if texture_resolution == 1024 else "ai_4k"
+        geometry_mode = "target_ready" if roblox_quality == "balanced" else "max_detail"
+        if target == "unreal":
+            geometry_mode = "original"
+        hardware_preset = "auto"
+    else:
+        texture_mode = _require_string(payload, "texture_mode")
+        geometry_mode = _require_string(payload, "geometry_mode")
+        hardware_preset = _require_string(payload, "hardware_preset")
+        if texture_mode not in {"native_2k", "ai_4k", "export_8k"}:
+            raise WorkerError(
+                "request-schema",
+                "texture_mode must be native_2k, ai_4k, or export_8k",
+            )
+        if geometry_mode not in GEOMETRY_MODES:
+            raise WorkerError(
+                "request-schema",
+                "geometry_mode must be target_ready, max_detail, or original",
+            )
+        if hardware_preset not in HARDWARE_PRESETS:
+            raise WorkerError(
+                "request-schema",
+                "hardware_preset must be auto, vram_8gb, or vram_16gb_plus",
+            )
 
-    roblox_quality = _require_string(payload, "roblox_quality")
-    if roblox_quality not in ROBLOX_VERTEX_TARGETS:
+    if texture_mode == "export_8k" and target != "unreal":
+        raise WorkerError("request-schema", "8K export is available only for Unreal")
+    if target == "unreal" and geometry_mode != "original":
+        raise WorkerError("request-schema", "Unreal geometry_mode must be original")
+    if target == "roblox" and geometry_mode == "original":
         raise WorkerError(
-            "request-schema", "roblox_quality must be 'balanced' or 'high'"
+            "request-schema", "Roblox geometry_mode must be target_ready or max_detail"
         )
 
     return Job(
         image_path=_validate_image_path(_require_string(payload, "image_path")),
         output_dir=_validate_output_root(_require_string(payload, "output_dir")),
         target=target,
-        texture_resolution=int(texture_resolution),
-        roblox_quality=roblox_quality,
+        texture_mode=texture_mode,
+        geometry_mode=geometry_mode,
+        hardware_preset=hardware_preset,
+        source_schema_version=int(schema_version),
     )
 
 
@@ -753,7 +791,7 @@ def _apply_texture_profile(
     *,
     color_size: int,
     data_size: int,
-    sharpen: dict[str, float | int],
+    sharpen: dict[str, float | int] | None,
     runtime: dict[str, Any],
 ) -> dict[str, Any]:
     enhanced: dict[str, dict[str, Any]] = {}
@@ -771,7 +809,7 @@ def _apply_texture_profile(
             "source_size": [int(source.size[0]), int(source.size[1])],
             "output_size": [int(result.size[0]), int(result.size[1])],
             "encoding": "PNG",
-            "luminance_sharpened": bool(is_color),
+            "luminance_sharpened": bool(is_color and sharpen is not None),
         }
     return enhanced
 
@@ -855,6 +893,214 @@ def _safe_remove_staging(staging: Path, output_root: Path) -> None:
         pass
 
 
+def _resolve_hardware_profile(job: Job, gpu_memory_bytes: int) -> dict[str, Any]:
+    """Resolve one UI preset into safe SPAR3D and texture-restoration settings."""
+
+    if job.hardware_preset == "vram_16gb_plus" and gpu_memory_bytes < HIGH_VRAM_THRESHOLD_BYTES:
+        raise WorkerError(
+            "hardware-profile",
+            "The 16GB+ preset needs at least 12 GB of detected VRAM. "
+            "Choose Auto or 8GB on this computer.",
+        )
+    if job.texture_mode == "export_8k" and gpu_memory_bytes < HIGH_VRAM_THRESHOLD_BYTES:
+        raise WorkerError(
+            "hardware-profile",
+            "AI 8K export needs the stronger computer (at least 12 GB detected VRAM). "
+            "Choose AI 4K on this computer.",
+        )
+
+    low_vram = (
+        job.hardware_preset == "vram_8gb"
+        or (
+            job.hardware_preset == "auto"
+            and gpu_memory_bytes < HIGH_VRAM_THRESHOLD_BYTES
+        )
+    )
+    return {
+        "requested": job.hardware_preset,
+        "resolved": "8gb-safe" if low_vram else "16gb-plus",
+        "low_vram_mode": low_vram,
+        "ai_tile_size": 256 if low_vram else 384,
+    }
+
+
+def _import_bundled_quality() -> Any:
+    """Import only the application-owned texture-quality package under -I."""
+
+    _require_bundled_path(
+        APP_ROOT / "quality" / "__init__.py",
+        kind="texture-quality package",
+    )
+    app_string = str(APP_ROOT)
+    sys.path[:] = [entry for entry in sys.path if entry != app_string]
+    sys.path.insert(0, app_string)
+    import quality as bundled_quality
+
+    expected_quality_root = (APP_ROOT / "quality").resolve(strict=True)
+    actual_quality_root = Path(bundled_quality.__file__).resolve(strict=True).parent
+    if actual_quality_root != expected_quality_root:
+        raise WorkerError(
+            "texture-ai-runtime",
+            "The texture-quality module was loaded from outside the application",
+        )
+    return bundled_quality
+
+
+def _apply_selected_texture_profile(
+    material: Any,
+    source_textures: dict[str, Any],
+    *,
+    job: Job,
+    hardware: dict[str, Any],
+    runtime: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Apply native lossless or verified AI restoration to the baked textures."""
+
+    target_edge = TEXTURE_MODES[job.texture_mode]
+    ai_requested = job.texture_mode in {"ai_4k", "export_8k"}
+    ai_passes = 2 if job.texture_mode == "export_8k" else 1
+    ai_strength = 0.68 if job.texture_mode == "export_8k" else 0.82
+    upscaler: Any = None
+    ai_error: str | None = None
+    quality_api: dict[str, Any] | None = None
+
+    if ai_requested:
+        try:
+            bundled_quality = _import_bundled_quality()
+
+            quality_api = {
+                "spec": bundled_quality.REALESRGAN_X2PLUS,
+                "resize_normal_map": bundled_quality.resize_normal_map,
+                "restore_color_texture": bundled_quality.restore_color_texture,
+            }
+            upscaler = bundled_quality.load_realesrgan_x2plus(
+                AI_TEXTURE_MODEL,
+                device="cuda",
+                half=True,
+            )
+        except Exception as exc:
+            ai_error = _sanitize(exc, 500)
+            print(
+                "AI texture restoration could not start; exporting a lossless "
+                f"Lanczos fallback instead: {ai_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    textures: dict[str, dict[str, Any]] = {}
+    try:
+        for attribute, source in source_textures.items():
+            is_base_color = attribute in {"baseColorTexture", "image"}
+            is_normal = attribute == "normalTexture"
+            # Unreal's 8K option spends memory where it can add visible color
+            # detail. Normal/packed data maps stay at 4K; larger copies add no
+            # learned information and make the GLB unnecessarily huge.
+            attribute_edge = (
+                target_edge
+                if is_base_color
+                else min(target_edge, 4096)
+            )
+            output_size = _scaled_texture_size(source.size, attribute_edge)
+            method = "lossless-native"
+
+            if is_base_color and ai_requested:
+                if quality_api is not None:
+                    result = quality_api["restore_color_texture"](
+                        source,
+                        target_size=output_size,
+                        upscaler=upscaler,
+                        ai_strength=ai_strength,
+                        tile_size=int(hardware["ai_tile_size"]),
+                        tile_pad=16,
+                        max_ai_passes=ai_passes,
+                    )
+                    method = "RealESRGAN-x2plus" if upscaler is not None else "Lanczos-fallback"
+                else:
+                    result = _enhance_texture_image(
+                        source,
+                        longest_edge=attribute_edge,
+                        runtime=runtime,
+                        sharpen=None,
+                    )
+                    method = "Lanczos-fallback"
+            elif is_normal and ai_requested and quality_api is not None:
+                result = quality_api["resize_normal_map"](source, output_size)
+                method = "vector-renormalized"
+            else:
+                result = _enhance_texture_image(
+                    source,
+                    longest_edge=attribute_edge,
+                    runtime=runtime,
+                    sharpen=None,
+                )
+                method = "Lanczos" if result.size != source.size else "native"
+
+            result.format = "PNG"
+            setattr(material, attribute, result)
+            textures[attribute] = {
+                "source_size": [int(source.size[0]), int(source.size[1])],
+                "output_size": [int(result.size[0]), int(result.size[1])],
+                "encoding": "PNG",
+                "method": method,
+            }
+    except Exception as exc:
+        if ai_requested and upscaler is not None:
+            # Never lose an otherwise valid 3D reconstruction to the optional
+            # restoration stage. Rebuild every texture from the untouched bake.
+            ai_error = _sanitize(exc, 500)
+            print(
+                f"AI texture restoration failed; using lossless fallback: {ai_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            textures = _apply_texture_profile(
+                material,
+                source_textures,
+                color_size=target_edge,
+                data_size=min(target_edge, 4096),
+                sharpen=None,
+                runtime=runtime,
+            )
+            for value in textures.values():
+                value["method"] = "Lanczos-fallback"
+        else:
+            raise
+    finally:
+        if upscaler is not None:
+            try:
+                upscaler.close()
+            except Exception:
+                pass
+        upscaler = None
+        gc.collect()
+        torch = runtime.get("torch")
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    ai_used = any(
+        value.get("method") == "RealESRGAN-x2plus" for value in textures.values()
+    )
+    profile = {
+        "mode": job.texture_mode,
+        "gpu_bake_resolution": (
+            1024 if job.texture_mode == "native_1k" else SPAR_BAKE_RESOLUTION
+        ),
+        "output_longest_edge": target_edge,
+        "lossless_png": True,
+        "ai_requested": ai_requested,
+        "ai_used": ai_used,
+        "ai_model": "RealESRGAN_x2plus" if ai_requested else None,
+        "ai_model_sha256": (
+            quality_api["spec"].sha256 if quality_api is not None else None
+        ),
+        "ai_strength": ai_strength if ai_requested else 0.0,
+        "ai_passes": ai_passes if ai_used else 0,
+        "ai_error": ai_error,
+        "textures": textures,
+    }
+    return textures, profile
+
+
 def _run_job(job: Job) -> Path:
     _emit_progress(3, "Validating the portable runtime")
     bundle = _validate_bundle()
@@ -862,6 +1108,7 @@ def _run_job(job: Job) -> Path:
     staging, final_dir = _create_output_paths(job)
     runtime: dict[str, Any] | None = None
     model: Any = None
+    mesh: Any = None
     published = False
     try:
         _emit_progress(8, "Loading pinned local dependencies")
@@ -871,7 +1118,14 @@ def _run_job(job: Job) -> Path:
             raise WorkerError(
                 "cuda-required", "A CUDA-capable NVIDIA GPU is required for SPAR3D"
             )
-        if job.target == "roblox" and not runtime["triangle_remesh_available"]:
+        cuda_properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        gpu_memory_bytes = int(cuda_properties.total_memory)
+        hardware = _resolve_hardware_profile(job, gpu_memory_bytes)
+        if (
+            job.target == "roblox"
+            and job.geometry_mode == "target_ready"
+            and not runtime["triangle_remesh_available"]
+        ):
             raise WorkerError(
                 "remesh-unavailable",
                 "Triangle remeshing support is missing from the bundled SPAR3D runtime",
@@ -882,15 +1136,24 @@ def _run_job(job: Job) -> Path:
         torch.cuda.empty_cache()
 
         seed = 42
+        random.seed(seed)
+        try:
+            import numpy as np
+
+            np.random.seed(seed)
+        except Exception:
+            pass
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        _emit_progress(38, "Loading SPAR3D from the bundled model in low-VRAM mode")
+        os.environ["SPAR3D_LOW_VRAM"] = "1" if hardware["low_vram_mode"] else "0"
+        mode_label = "8GB-safe" if hardware["low_vram_mode"] else "16GB+ full"
+        _emit_progress(38, f"Loading SPAR3D in {mode_label} mode")
         try:
             model = runtime["SPAR3D"].from_pretrained(
                 str(bundle.model_root),
                 config_name=MODEL_CONFIG_NAME,
                 weight_name=MODEL_WEIGHT_NAME,
-                low_vram_mode=True,
+                low_vram_mode=bool(hardware["low_vram_mode"]),
             )
             dinov2_source = _prepare_dinov2_dependency(
                 model, hub_cache, bundle, runtime
@@ -902,23 +1165,32 @@ def _run_job(job: Job) -> Path:
         except Exception as exc:
             raise WorkerError("model-load", f"Could not load the bundled SPAR3D model: {exc}") from exc
 
-        if job.target == "roblox":
+        if job.target == "roblox" and job.geometry_mode == "target_ready":
             remesh_option = "triangle"
-            target_vertices: int | None = ROBLOX_VERTEX_TARGETS[job.roblox_quality]
+            target_vertices: int | None = ROBLOX_READY_VERTEX_TARGET
             vertex_count = target_vertices
         else:
             remesh_option = "none"
             target_vertices = None
             vertex_count = -1
 
+        bake_resolution = (
+            1024 if job.texture_mode == "native_1k" else SPAR_BAKE_RESOLUTION
+        )
+        autocast_dtype = (
+            torch.bfloat16
+            if torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
+
         _emit_progress(55, "Reconstructing the 3D surface and textures")
         try:
             with torch.no_grad(), torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16
+                device_type="cuda", dtype=autocast_dtype
             ):
                 mesh, generation = model.run_image(
                     [image],
-                    bake_resolution=job.texture_resolution,
+                    bake_resolution=bake_resolution,
                     remesh=remesh_option,
                     vertex_count=vertex_count,
                     return_points=True,
@@ -926,7 +1198,7 @@ def _run_job(job: Job) -> Path:
         except torch.cuda.OutOfMemoryError as exc:
             raise WorkerError(
                 "cuda-out-of-memory",
-                "GPU memory was exhausted. Close GPU applications and try texture_resolution 1024.",
+                "GPU memory was exhausted. Close GPU applications and choose the 8GB preset.",
             ) from exc
         except Exception as exc:
             raise WorkerError("reconstruction", f"SPAR3D reconstruction failed: {exc}") from exc
@@ -941,8 +1213,9 @@ def _run_job(job: Job) -> Path:
         except Exception:
             points_path.unlink(missing_ok=True)
 
-        # The neural model is no longer needed. Release it before CPU texture
-        # enhancement so Ultra+ has as much RAM/VRAM headroom as possible.
+        # SPAR3D and Real-ESRGAN never share VRAM. This is what lets the same
+        # executable offer AI 4K safely on 8 GB cards and larger tiles on a
+        # stronger computer.
         generation = None
         image = None
         model = None
@@ -950,37 +1223,28 @@ def _run_job(job: Job) -> Path:
         torch.cuda.empty_cache()
 
         material, source_textures = _capture_material_textures(mesh)
-        if job.texture_resolution == ULTRA_SOURCE_RESOLUTION:
-            _emit_progress(82, "Creating lossless Ultra 4K textures")
-            texture_profile = "ultra-4k-lossless"
-            texture_info = _apply_texture_profile(
-                material,
-                source_textures,
-                color_size=ULTRA_TEXTURE_SIZE,
-                data_size=ULTRA_TEXTURE_SIZE,
-                sharpen=ULTRA_SHARPEN,
-                runtime=runtime,
-            )
+        if job.texture_mode == "native_1k" or job.texture_mode == "native_2k":
+            _emit_progress(80, "Preserving the original bake as lossless PNG")
+        elif job.texture_mode == "ai_4k":
+            _emit_progress(80, "Restoring the color texture with AI at 4K")
         else:
-            _emit_progress(82, "Preserving baked textures as lossless PNG")
-            texture_profile = "lossless-native"
-            texture_info = _apply_texture_profile(
-                material,
-                source_textures,
-                color_size=job.texture_resolution,
-                data_size=job.texture_resolution,
-                sharpen=ULTRA_SHARPEN,
-                runtime=runtime,
-            )
+            _emit_progress(80, "Restoring the color texture with AI for 8K Unreal export")
+        texture_info, texture_profile = _apply_selected_texture_profile(
+            material,
+            source_textures,
+            job=job,
+            hardware=hardware,
+            runtime=runtime,
+        )
 
-        _emit_progress(87, "Exporting lossless GLB")
+        _emit_progress(91, "Exporting one lossless GLB matching your selection")
         glb_path = staging / "model.glb"
         try:
             mesh.export(str(glb_path), include_normals=True)
         except Exception as exc:
             raise WorkerError("glb-export", f"GLB export failed: {exc}") from exc
 
-        _emit_progress(90, "Validating lossless GLB")
+        _emit_progress(94, "Validating lossless GLB")
         glb_info = _glb_metadata(glb_path)
         if glb_info["images"] and glb_info["png_images"] != glb_info["images"]:
             raise WorkerError(
@@ -989,60 +1253,7 @@ def _run_job(job: Job) -> Path:
             )
         glb_hash = _sha256(glb_path)
 
-        ultra_plus_info: dict[str, Any] | None = None
-        ultra_plus_hash: str | None = None
-        ultra_plus_error: str | None = None
-        ultra_plus_texture_info: dict[str, Any] | None = None
-        create_ultra_plus = (
-            job.texture_resolution == ULTRA_SOURCE_RESOLUTION
-            and (job.target == "unreal" or job.roblox_quality == "high")
-        )
-        ultra_plus_color_size = (
-            ULTRA_PLUS_TEXTURE_SIZE if job.target == "unreal" else ULTRA_TEXTURE_SIZE
-        )
-        ultra_plus_label = "Ultra+ 8K" if job.target == "unreal" else "Ultra+ 4K"
-        ultra_plus_name = (
-            "model_UltraPlus_8K.glb"
-            if job.target == "unreal"
-            else "model_UltraPlus_4K.glb"
-        )
-        ultra_plus_path = staging / ultra_plus_name
-        if create_ultra_plus:
-            _emit_progress(92, f"Creating optional {ultra_plus_label} texture")
-            try:
-                ultra_plus_texture_info = _apply_texture_profile(
-                    material,
-                    source_textures,
-                    color_size=ultra_plus_color_size,
-                    data_size=ULTRA_TEXTURE_SIZE,
-                    sharpen=ULTRA_PLUS_SHARPEN,
-                    runtime=runtime,
-                )
-                mesh.export(str(ultra_plus_path), include_normals=True)
-                ultra_plus_info = _glb_metadata(ultra_plus_path)
-                if (
-                    ultra_plus_info["images"]
-                    and ultra_plus_info["png_images"] != ultra_plus_info["images"]
-                ):
-                    raise WorkerError(
-                        "glb-texture-encoding",
-                        "The Ultra+ GLB contains a texture that is not lossless PNG",
-                    )
-                ultra_plus_hash = _sha256(ultra_plus_path)
-            except Exception as exc:
-                ultra_plus_error = _sanitize(exc, 300)
-                ultra_plus_path.unlink(missing_ok=True)
-                print(
-                    f"{ultra_plus_label} was skipped; the verified Ultra 4K model is ready: "
-                    + ultra_plus_error,
-                    file=sys.stderr,
-                    flush=True,
-                )
-            finally:
-                gc.collect()
-
-        _emit_progress(95, "Finalizing the verified asset")
-        cuda_properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        _emit_progress(96, "Finalizing the verified asset")
 
         manifest: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
@@ -1050,8 +1261,10 @@ def _run_job(job: Job) -> Path:
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "request": {
                 "target": job.target,
-                "texture_resolution": job.texture_resolution,
-                "roblox_quality": job.roblox_quality,
+                "source_schema_version": job.source_schema_version,
+                "texture_mode": job.texture_mode,
+                "geometry_mode": job.geometry_mode,
+                "hardware_preset": job.hardware_preset,
             },
             "source": {
                 "original_name": job.image_path.name,
@@ -1073,22 +1286,14 @@ def _run_job(job: Job) -> Path:
                 "background_checkpoint": "models/transparent-background/ckpt_base.pth",
                 "device": "cuda",
                 "gpu": str(cuda_properties.name),
-                "gpu_memory_bytes": int(cuda_properties.total_memory),
+                "gpu_memory_bytes": gpu_memory_bytes,
                 "torch_version": str(torch.__version__),
-                "low_vram_mode": True,
+                "autocast_dtype": str(autocast_dtype),
+                "hardware_profile": hardware,
+                "low_vram_mode": bool(hardware["low_vram_mode"]),
                 "foreground_ratio": FOREGROUND_RATIO,
                 "seed": seed,
-                "texture_enhancement": {
-                    "profile": texture_profile,
-                    "gpu_bake_resolution": job.texture_resolution,
-                    "lossless_png": True,
-                    "textures": texture_info,
-                    "ultra_plus_requested": create_ultra_plus,
-                    "ultra_plus_created": ultra_plus_info is not None,
-                    "ultra_plus_profile": ultra_plus_label,
-                    "ultra_plus_error": ultra_plus_error,
-                    "ultra_plus_textures": ultra_plus_texture_info,
-                },
+                "texture_enhancement": texture_profile,
                 "remesh": {
                     "option": remesh_option,
                     "count_type": "vertex" if target_vertices is not None else "keep",
@@ -1099,11 +1304,6 @@ def _run_job(job: Job) -> Path:
                 "glb": "model.glb",
                 "glb_sha256": glb_hash,
                 "glb_stats": glb_info,
-                "ultra_plus_glb": (
-                    ultra_plus_name if ultra_plus_info is not None else None
-                ),
-                "ultra_plus_glb_sha256": ultra_plus_hash,
-                "ultra_plus_glb_stats": ultra_plus_info,
                 "prepared_image": "input_prepared.png",
                 "points": "points.ply" if points_exported else None,
             },
@@ -1115,9 +1315,7 @@ def _run_job(job: Job) -> Path:
             raise WorkerError("output-conflict", "The final output directory already exists")
         staging.rename(final_dir)
         published = True
-        final_glb = final_dir / (
-            ultra_plus_name if ultra_plus_info is not None else "model.glb"
-        )
+        final_glb = final_dir / "model.glb"
         _emit_progress(100, "3D model completed")
         _emit_artifact(final_glb)
         return final_glb
@@ -1136,17 +1334,51 @@ def _run_job(job: Job) -> Path:
 
 
 def _self_test() -> int:
+    sample_job = Job(
+        image_path=Path("input.png"),
+        output_dir=Path("output"),
+        target="roblox",
+        texture_mode="ai_4k",
+        geometry_mode="target_ready",
+        hardware_preset="auto",
+        source_schema_version=2,
+    )
+    low_profile = _resolve_hardware_profile(sample_job, 8 * 1024**3)
+    high_profile = _resolve_hardware_profile(sample_job, 16 * 1024**3)
     checks: list[tuple[bool, str]] = [
-        (SCHEMA_VERSION == 1, "schema version"),
+        (SCHEMA_VERSION == 2, "schema version"),
+        (SUPPORTED_SCHEMA_VERSIONS == {1, 2}, "supported schema versions"),
         (FOREGROUND_RATIO == 1.3, "foreground ratio"),
         (TARGETS == {"roblox", "unreal"}, "targets"),
-        (TEXTURE_RESOLUTIONS == {1024, 2048}, "texture resolutions"),
-        (ULTRA_SOURCE_RESOLUTION == 2048, "Ultra source resolution"),
-        (ULTRA_TEXTURE_SIZE == 4096, "Ultra texture size"),
-        (ULTRA_PLUS_TEXTURE_SIZE == 8192, "Ultra+ texture size"),
-        (ROBLOX_VERTEX_TARGETS == {"balanced": 10_000, "high": 25_000}, "Roblox targets"),
+        (
+            TEXTURE_MODES
+            == {
+                "native_1k": 1024,
+                "native_2k": 2048,
+                "ai_4k": 4096,
+                "export_8k": 8192,
+            },
+            "texture modes",
+        ),
+        (
+            HARDWARE_PRESETS == {"auto", "vram_8gb", "vram_16gb_plus"},
+            "hardware presets",
+        ),
+        (
+            GEOMETRY_MODES == {"target_ready", "max_detail", "original"},
+            "geometry modes",
+        ),
+        (ROBLOX_READY_VERTEX_TARGET == 9_500, "Roblox ready target"),
+        (SPAR_BAKE_RESOLUTION == 2048, "SPAR bake resolution"),
+        (low_profile["low_vram_mode"] is True, "automatic 8GB profile"),
+        (high_profile["low_vram_mode"] is False, "automatic 16GB profile"),
         (VENDOR_ROOT == APP_ROOT / "vendor" / "stable-point-aware-3d", "vendor path"),
         (MODEL_ROOT == BUNDLE_ROOT / "models" / "spar3d", "model path"),
+        (
+            AI_TEXTURE_MODEL
+            == BUNDLE_ROOT / "models" / "realesrgan" / "RealESRGAN_x2plus.pth",
+            "AI texture model path",
+        ),
         (DINO_REPOSITORY == "facebook/dinov2-large", "DINOv2 repository"),
         (len(DINO_REVISION) == 40, "DINOv2 revision"),
         (len(DINO_WEIGHT_SHA256) == 64, "DINOv2 weight digest"),
@@ -1165,7 +1397,7 @@ def _self_test() -> int:
     if failed:
         _emit_error("self-test", f"Failed checks: {', '.join(failed)}")
         return 1
-    print("MJSELFTEST|OK|1", flush=True)
+    print("MJSELFTEST|OK|2", flush=True)
     return 0
 
 
@@ -1179,6 +1411,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to the JSON request (launcher-friendly form)",
     )
     parser.add_argument("--self-test", action="store_true", help="Run lightweight checks")
+    parser.add_argument(
+        "--quality-self-test",
+        action="store_true",
+        help="Import and exercise the bundled AI texture module under isolated mode",
+    )
     return parser
 
 
@@ -1186,6 +1423,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.self_test:
         return _self_test()
+    if args.quality_self_test:
+        try:
+            result = _import_bundled_quality().self_test()
+            print(
+                "MJQUALITYSELFTEST|OK|" + json.dumps(result, sort_keys=True),
+                flush=True,
+            )
+            return 0
+        except Exception as exc:
+            _emit_error("quality-self-test", exc)
+            return 1
     request_value = args.request_option or args.request
     if not request_value:
         _emit_error("usage", "A JSON request path is required")

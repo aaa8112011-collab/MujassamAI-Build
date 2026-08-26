@@ -15,6 +15,13 @@ $CudaVersion = "12.4"
 $CudaInstallerMd5 = "8901c95cd9e20b8fc73fc76e96065d03"
 $ClipCommit = "dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1"
 $AlphaClipCommit = "f1ec829fb2cf14d470d841d66114bf883a838b0d"
+$CudaArchitectures = "7.5;8.0;8.6;8.9+PTX"
+$RealEsrganUrl = (
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/" +
+    "v0.2.1/RealESRGAN_x2plus.pth"
+)
+$RealEsrganBytes = 67061725
+$RealEsrganSha256 = "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb"
 
 $RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $AppSource = Join-Path $RepositoryRoot "app"
@@ -206,6 +213,10 @@ foreach ($requiredAppFile in @("Program.cs", "MainForm.cs", "worker.py")) {
     if (-not (Test-Path $requiredPath -PathType Leaf)) {
         throw "Missing application source file: $requiredPath"
     }
+}
+$QualitySource = Join-Path $AppSource "quality"
+if (-not (Test-Path (Join-Path $QualitySource "realesrgan_x2.py") -PathType Leaf)) {
+    throw "Missing application texture-quality module: $QualitySource"
 }
 if (-not (Test-Path $InstallerSource -PathType Leaf)) {
     throw "Missing installer source file: $InstallerSource"
@@ -422,7 +433,7 @@ $TransparentBackgroundInitText |
 
 $env:USE_CUDA = "1"
 $env:USE_NATIVE_ARCH = "0"
-$env:TORCH_CUDA_ARCH_LIST = "8.9"
+$env:TORCH_CUDA_ARCH_LIST = $CudaArchitectures
 $env:MAX_JOBS = "2"
 $env:DISTUTILS_USE_SDK = "1"
 $env:MSSdk = "1"
@@ -467,6 +478,9 @@ $PortableVendor = New-Item -ItemType Directory -Path (
     Join-Path $PortableApp.FullName "vendor\stable-point-aware-3d"
 )
 $ModelRoot = New-Item -ItemType Directory -Path (Join-Path $DistRoot "models\spar3d")
+$RealEsrganRoot = New-Item -ItemType Directory -Path (
+    Join-Path $DistRoot "models\realesrgan"
+)
 $BackgroundRoot = New-Item -ItemType Directory -Path (
     Join-Path $DistRoot "models\transparent-background"
 )
@@ -544,6 +558,7 @@ foreach ($engineEntry in @(
 }
 
 Copy-Item (Join-Path $AppSource "worker.py") $PortableApp.FullName -Force
+Copy-Item $QualitySource (Join-Path $PortableApp.FullName "quality") -Recurse -Force
 Copy-Item (Join-Path $SourceRoot "LICENSE.md") (
     Join-Path $DistRoot "LICENSE-SPAR3D.md"
 ) -Force
@@ -552,6 +567,10 @@ foreach ($RepositoryDocument in @("LICENSE", "NOTICE_THIRD_PARTY.md", "VERSION.t
     if (Test-Path $DocumentPath -PathType Leaf) {
         Copy-Item $DocumentPath $DistRoot -Force
     }
+}
+$RepositoryLicenseRoot = Join-Path $RepositoryRoot "licenses"
+if (Test-Path $RepositoryLicenseRoot -PathType Container) {
+    Copy-Item (Join-Path $RepositoryLicenseRoot "*") $LicenseRoot.FullName -Recurse -Force
 }
 Remove-Item $SourceRoot -Recurse -Force
 
@@ -596,27 +615,6 @@ $CscArguments = @(
 
 & $Csc @CscArguments
 
-$GuiSelfTestReport = Join-Path $env:RUNNER_TEMP "mujassam-gui-self-test.txt"
-$PreviousNativePreference = $PSNativeCommandUseErrorActionPreference
-try {
-    $PSNativeCommandUseErrorActionPreference = $false
-    & (Join-Path $DistRoot "MujassamAI.exe") --self-test $GuiSelfTestReport
-    $GuiSelfTestExitCode = $LASTEXITCODE
-} finally {
-    $PSNativeCommandUseErrorActionPreference = $PreviousNativePreference
-}
-if ($GuiSelfTestExitCode -ne 0) {
-    $GuiSelfTestDetails = if (Test-Path $GuiSelfTestReport -PathType Leaf) {
-        Get-Content $GuiSelfTestReport -Raw
-    } else {
-        "MujassamAI.exe did not create its self-test report"
-    }
-    throw "MujassamAI.exe self-test failed: $GuiSelfTestDetails"
-}
-if (Test-Path $GuiSelfTestReport) {
-    Remove-Item $GuiSelfTestReport -Force
-}
-
 # Copy the current VC runtime and OpenMP redistributables app-locally.
 $RedistBase = Join-Path $VsInstall "VC\Redist\MSVC"
 $LatestRedist = Get-ChildItem $RedistBase -Directory |
@@ -656,6 +654,44 @@ python (Join-Path $PSScriptRoot "download_models.py") `
     --background-dir $BackgroundRoot.FullName `
     --revision $ModelRevision `
     --manifest (Join-Path $DistRoot "MODEL-MANIFEST.json")
+
+Write-Host "Downloading and verifying the official Real-ESRGAN x2plus model"
+$RealEsrganPath = Join-Path $RealEsrganRoot.FullName "RealESRGAN_x2plus.pth"
+Invoke-WebRequest $RealEsrganUrl -OutFile $RealEsrganPath
+$RealEsrganItem = Get-Item $RealEsrganPath
+$ActualRealEsrganSha256 = (
+    Get-FileHash $RealEsrganPath -Algorithm SHA256
+).Hash.ToLowerInvariant()
+if ($RealEsrganItem.Length -ne $RealEsrganBytes -or
+    $ActualRealEsrganSha256 -ne $RealEsrganSha256) {
+    throw (
+        "Real-ESRGAN x2plus verification failed: bytes={0}, sha256={1}" -f
+        $RealEsrganItem.Length, $ActualRealEsrganSha256
+    )
+}
+
+# The GUI self-test now validates the AI module and model paths too, so run it
+# only after the verified Real-ESRGAN checkpoint is staged.
+$GuiSelfTestReport = Join-Path $env:RUNNER_TEMP "mujassam-gui-self-test.txt"
+$PreviousNativePreference = $PSNativeCommandUseErrorActionPreference
+try {
+    $PSNativeCommandUseErrorActionPreference = $false
+    & (Join-Path $DistRoot "MujassamAI.exe") --self-test $GuiSelfTestReport
+    $GuiSelfTestExitCode = $LASTEXITCODE
+} finally {
+    $PSNativeCommandUseErrorActionPreference = $PreviousNativePreference
+}
+if ($GuiSelfTestExitCode -ne 0) {
+    $GuiSelfTestDetails = if (Test-Path $GuiSelfTestReport -PathType Leaf) {
+        Get-Content $GuiSelfTestReport -Raw
+    } else {
+        "MujassamAI.exe did not create its self-test report"
+    }
+    throw "MujassamAI.exe self-test failed: $GuiSelfTestDetails"
+}
+if (Test-Path $GuiSelfTestReport) {
+    Remove-Item $GuiSelfTestReport -Force
+}
 
 # Copy package license files carried in wheel metadata.
 Get-ChildItem $PortableSitePackages -Directory -Filter "*.dist-info" |
@@ -717,6 +753,29 @@ $PreviousVendorRoot = $env:MUJASSAM_VENDOR_ROOT
 $env:MUJASSAM_VENDOR_ROOT = $PortableVendor.FullName
 
 & $ApplicationPython -B (Join-Path $PortableApp.FullName "worker.py") --self-test
+& $ApplicationPython -I -X utf8 `
+    (Join-Path $PortableApp.FullName "worker.py") --quality-self-test
+
+$PreviousPythonPath = $env:PYTHONPATH
+$PreviousAiWeight = $env:MUJASSAM_AI_WEIGHT
+$PreviousAppRoot = $env:MUJASSAM_APP_ROOT
+$env:PYTHONPATH = $PortableApp.FullName
+$env:MUJASSAM_AI_WEIGHT = $RealEsrganPath
+$env:MUJASSAM_APP_ROOT = $PortableApp.FullName
+& $ApplicationPython -B -c @'
+import json
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, os.environ["MUJASSAM_APP_ROOT"])
+from quality import self_test, verify_weight_file
+print(json.dumps(self_test(), sort_keys=True))
+verified = verify_weight_file(Path(os.environ["MUJASSAM_AI_WEIGHT"]))
+print("verified AI texture model:", verified.name)
+'@
+$env:PYTHONPATH = $PreviousPythonPath
+$env:MUJASSAM_AI_WEIGHT = $PreviousAiWeight
+$env:MUJASSAM_APP_ROOT = $PreviousAppRoot
 
 & $ApplicationPython -B -c @'
 import importlib
@@ -754,7 +813,7 @@ Python: $PythonVersion application-local x64
 PyTorch: $TorchVersion
 TorchVision: $TorchVisionVersion
 CUDA build toolkit: $CudaVersion
-CUDA extension architecture: 8.9
+CUDA extension architectures: $CudaArchitectures
 MSVC compiler: $ClPath
 
 Installed Python packages:

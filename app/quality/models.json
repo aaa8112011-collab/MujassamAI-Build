@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "models": {
+    "realesrgan_x2plus": {
+      "file_name": "RealESRGAN_x2plus.pth",
+      "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+      "bytes": 67061725,
+      "sha256": "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb",
+      "checkpoint_key": "params_ema",
+      "scale": 2,
+      "license": "BSD-3-Clause",
+      "source": "https://github.com/xinntao/Real-ESRGAN"
+    }
+  }
+}

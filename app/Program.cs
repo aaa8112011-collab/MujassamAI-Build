@@ -34,6 +34,7 @@ namespace MujassamPortable
             try
             {
                 string missing = MainForm.ValidatePortableLayout();
+                string schemaError = MainForm.ValidateConfigurationSchema();
                 StringBuilder report = new StringBuilder();
                 report.AppendLine("Mujassam Portable GUI self-test");
                 report.AppendLine("BaseDirectory=" + AppDomain.CurrentDomain.BaseDirectory);
@@ -42,9 +43,14 @@ namespace MujassamPortable
                 report.AppendLine("PortableLayout=" + (String.IsNullOrEmpty(missing) ? "OK" : "MISSING"));
                 if (!String.IsNullOrEmpty(missing))
                     report.AppendLine(missing);
+                report.AppendLine("JobSchemaVersion=" + MainForm.JobSchemaVersion);
+                report.AppendLine("JobSchema=" + (String.IsNullOrEmpty(schemaError) ? "OK" : "FAILED"));
+                if (!String.IsNullOrEmpty(schemaError))
+                    report.AppendLine(schemaError);
                 EnsureParentDirectory(reportPath);
                 File.WriteAllText(reportPath, report.ToString(), new UTF8Encoding(false));
-                return String.IsNullOrEmpty(missing) && Environment.Is64BitProcess ? 0 : 10;
+                return String.IsNullOrEmpty(missing) && String.IsNullOrEmpty(schemaError) &&
+                    Environment.Is64BitProcess ? 0 : 10;
             }
             catch (Exception ex)
             {
