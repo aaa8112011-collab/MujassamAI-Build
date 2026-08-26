@@ -1,0 +1,14 @@
+.vs/
+bin/
+obj/
+build/work/
+dist/
+release/
+*.zip
+*.7z
+*.safetensors
+*.pth
+*.onnx
+hf_*
+__pycache__/
+*.pyc
