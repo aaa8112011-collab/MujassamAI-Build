@@ -49,6 +49,8 @@ MODEL_WEIGHT_NAME = "model.safetensors"
 DINO_REPOSITORY = "facebook/dinov2-large"
 DINO_REVISION = "0ff9d1340c9524c60f3f03e8573c57a1f8197f24"
 DINO_WEIGHT_SHA256 = "399fba97a95f22c36834418bc69373364a99af3a1153da1c0fb31db567c92e23"
+HUB_DOWNLOAD_TIMEOUT_SECONDS = 300
+HUB_ETAG_TIMEOUT_SECONDS = 60
 
 _SENSITIVE_PATTERN = re.compile(
     r"(?i)(?:hf_[a-z0-9]{12,}|bearer\s+[a-z0-9._~+/=-]{12,}|"
@@ -318,6 +320,8 @@ def _configure_runtime_environment(bundle: BundlePaths) -> Path:
         "HF_HOME": str(application_state / "HuggingFace"),
         "HF_HUB_CACHE": str(hub_cache),
         "TRANSFORMERS_CACHE": str(application_state / "HuggingFace" / "transformers"),
+        "HF_HUB_DOWNLOAD_TIMEOUT": str(HUB_DOWNLOAD_TIMEOUT_SECONDS),
+        "HF_HUB_ETAG_TIMEOUT": str(HUB_ETAG_TIMEOUT_SECONDS),
         "HF_DATASETS_OFFLINE": "1",
         "DIFFUSERS_OFFLINE": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1",
@@ -372,7 +376,10 @@ def _prepare_dinov2_dependency(model: Any, hub_cache: Path) -> bool:
 
         downloaded = True
         if filename == "model.safetensors":
-            _emit_progress(46, "Downloading the one-time DINOv2 helper model (1.22 GB)")
+            _emit_progress(
+                46,
+                "Downloading the one-time DINOv2 helper model (1.22 GB); interrupted transfers resume",
+            )
         else:
             _emit_progress(44, "Preparing the one-time DINOv2 helper model")
         try:
@@ -795,6 +802,8 @@ def _self_test() -> int:
         (DINO_REPOSITORY == "facebook/dinov2-large", "DINOv2 repository"),
         (len(DINO_REVISION) == 40, "DINOv2 revision"),
         (len(DINO_WEIGHT_SHA256) == 64, "DINOv2 weight digest"),
+        (HUB_DOWNLOAD_TIMEOUT_SECONDS == 300, "download timeout"),
+        (HUB_ETAG_TIMEOUT_SECONDS == 60, "metadata timeout"),
         (
             BACKGROUND_CHECKPOINT
             == BUNDLE_ROOT / "models" / "transparent-background" / "ckpt_base.pth",
