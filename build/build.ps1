@@ -270,6 +270,13 @@ $CudaProcess = Start-Process `
         "nvcc_12.4",
         "cudart_12.4",
         "thrust_12.4",
+        "cublas_12.4",
+        "cublas_dev_12.4",
+        "cusolver_12.4",
+        "cusolver_dev_12.4",
+        "cusparse_12.4",
+        "cusparse_dev_12.4",
+        "nvjitlink_12.4",
         "cuobjdump_12.4"
     ) `
     -Wait `
@@ -284,6 +291,22 @@ $CudaHome = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
 $Nvcc = Join-Path $CudaHome "bin\nvcc.exe"
 if (-not (Test-Path $Nvcc -PathType Leaf)) {
     throw "CUDA compiler was not installed at $Nvcc"
+}
+
+# PyTorch's CUDAContextLight.h includes these development headers even when a
+# custom extension only calls the CUDA runtime. Verify them here so a partial
+# network-installer result fails with a precise error before wheel compilation.
+foreach ($CudaHeader in @(
+    "cuda_runtime_api.h",
+    "cublas_v2.h",
+    "cublasLt.h",
+    "cusolverDn.h",
+    "cusparse.h"
+)) {
+    $CudaHeaderPath = Join-Path $CudaHome "include\$CudaHeader"
+    if (-not (Test-Path $CudaHeaderPath -PathType Leaf)) {
+        throw "Required CUDA development header was not installed: $CudaHeaderPath"
+    }
 }
 
 $env:CUDA_HOME = $CudaHome
