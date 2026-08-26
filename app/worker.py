@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Portable, offline SPAR3D worker used by MujassamAI.
+"""Portable SPAR3D worker used by MujassamAI.
 
 The worker accepts one JSON request file and communicates with the launcher only
-through the line-oriented MJ* protocol on stdout.  Model and vendor locations
-are deliberately fixed relative to this file so a packaged build cannot fall
-back to Hugging Face or another network source.
+through the line-oriented MJ* protocol on stdout.  The gated SPAR3D model and
+vendor source are always loaded from the application bundle.  SPAR3D's public
+DINOv2 dependency is downloaded once into LocalAppData, pinned, and reused.
 """
 
 from __future__ import annotations
@@ -46,6 +46,9 @@ BACKGROUND_CHECKPOINT = (
 
 MODEL_CONFIG_NAME = "config.yaml"
 MODEL_WEIGHT_NAME = "model.safetensors"
+DINO_REPOSITORY = "facebook/dinov2-large"
+DINO_REVISION = "0ff9d1340c9524c60f3f03e8573c57a1f8197f24"
+DINO_WEIGHT_SHA256 = "399fba97a95f22c36834418bc69373364a99af3a1153da1c0fb31db567c92e23"
 
 _SENSITIVE_PATTERN = re.compile(
     r"(?i)(?:hf_[a-z0-9]{12,}|bearer\s+[a-z0-9._~+/=-]{12,}|"
@@ -292,7 +295,7 @@ def _parse_job(payload: dict[str, Any]) -> Job:
     )
 
 
-def _configure_strict_offline_mode(bundle: BundlePaths) -> None:
+def _configure_runtime_environment(bundle: BundlePaths) -> Path:
     # transparent-background writes a tiny generated config next to its state
     # directory even when an explicit checkpoint is supplied.  Keep that state
     # in LocalAppData instead of modifying the portable application folder.
@@ -302,10 +305,19 @@ def _configure_strict_offline_mode(bundle: BundlePaths) -> None:
         or os.environ.get("TMP")
         or str(Path.cwd())
     )
-    background_state = state_base / "MujassamAI"
+    application_state = state_base / "MujassamAI"
+    hub_cache = application_state / "HuggingFace" / "hub"
+    try:
+        hub_cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WorkerError(
+            "cache-path", f"Could not create the local model cache: {exc}"
+        ) from exc
+
     forced = {
-        "HF_HUB_OFFLINE": "1",
-        "TRANSFORMERS_OFFLINE": "1",
+        "HF_HOME": str(application_state / "HuggingFace"),
+        "HF_HUB_CACHE": str(hub_cache),
+        "TRANSFORMERS_CACHE": str(application_state / "HuggingFace" / "transformers"),
         "HF_DATASETS_OFFLINE": "1",
         "DIFFUSERS_OFFLINE": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1",
@@ -315,12 +327,90 @@ def _configure_strict_offline_mode(bundle: BundlePaths) -> None:
         "SPAR3D_LOW_VRAM": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONUTF8": "1",
-        "TRANSPARENT_BACKGROUND_FILE_PATH": str(background_state),
+        "TRANSPARENT_BACKGROUND_FILE_PATH": str(application_state),
     }
     for key, value in forced.items():
         os.environ[key] = value
+    # huggingface_hub reads HF_HUB_OFFLINE while it is imported.  Explicitly
+    # remove inherited offline flags so the missing public DINOv2 files can be
+    # fetched on the first run.  All gated SPAR3D assets remain bundle-local.
+    for offline_name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        os.environ.pop(offline_name, None)
     for secret_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         os.environ.pop(secret_name, None)
+    return hub_cache
+
+
+def _prepare_dinov2_dependency(model: Any, hub_cache: Path) -> bool:
+    """Resolve the pinned public DINOv2 snapshot and point SPAR3D at it.
+
+    Returns True when the weight file had to be downloaded during this run.
+    """
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception as exc:
+        raise WorkerError(
+            "dinov2-runtime", f"The bundled DINOv2 downloader could not load: {exc}"
+        ) from exc
+
+    paths: dict[str, Path] = {}
+    downloaded = False
+    for filename in ("config.json", "model.safetensors"):
+        try:
+            cached = hf_hub_download(
+                repo_id=DINO_REPOSITORY,
+                filename=filename,
+                revision=DINO_REVISION,
+                cache_dir=str(hub_cache),
+                local_files_only=True,
+            )
+            paths[filename] = Path(cached).resolve(strict=True)
+            continue
+        except Exception:
+            pass
+
+        downloaded = True
+        if filename == "model.safetensors":
+            _emit_progress(46, "Downloading the one-time DINOv2 helper model (1.22 GB)")
+        else:
+            _emit_progress(44, "Preparing the one-time DINOv2 helper model")
+        try:
+            fetched = hf_hub_download(
+                repo_id=DINO_REPOSITORY,
+                filename=filename,
+                revision=DINO_REVISION,
+                cache_dir=str(hub_cache),
+                local_files_only=False,
+            )
+            paths[filename] = Path(fetched).resolve(strict=True)
+        except Exception as exc:
+            raise WorkerError(
+                "dinov2-download",
+                "The one-time DINOv2 download failed. Check the internet connection "
+                f"and try again: {exc}",
+            ) from exc
+
+    config_path = paths["config.json"]
+    weight_path = paths["model.safetensors"]
+    if config_path.parent != weight_path.parent:
+        raise WorkerError("dinov2-cache", "The local DINOv2 cache is inconsistent")
+    if weight_path.stat().st_size < 1_000_000_000:
+        raise WorkerError("dinov2-cache", "The cached DINOv2 weights are incomplete")
+    _emit_progress(49, "Verifying the local DINOv2 helper model")
+    if _sha256(weight_path) != DINO_WEIGHT_SHA256:
+        raise WorkerError("dinov2-cache", "The cached DINOv2 weights failed verification")
+
+    local_snapshot = str(config_path.parent)
+    try:
+        model.cfg.image_tokenizer.pretrained_model_name_or_path = local_snapshot
+        model.cfg.pdiff_image_tokenizer.pretrained_model_name_or_path = local_snapshot
+    except Exception as exc:
+        raise WorkerError(
+            "dinov2-config", f"Could not configure the local DINOv2 model: {exc}"
+        ) from exc
+    _emit_progress(51, "DINOv2 helper model is ready")
+    return downloaded
 
 
 def _sha256(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
@@ -528,7 +618,7 @@ def _safe_remove_staging(staging: Path, output_root: Path) -> None:
 def _run_job(job: Job) -> Path:
     _emit_progress(3, "Validating the portable runtime")
     bundle = _validate_bundle()
-    _configure_strict_offline_mode(bundle)
+    hub_cache = _configure_runtime_environment(bundle)
     staging, final_dir = _create_output_paths(job)
     runtime: dict[str, Any] | None = None
     model: Any = None
@@ -562,8 +652,11 @@ def _run_job(job: Job) -> Path:
                 weight_name=MODEL_WEIGHT_NAME,
                 low_vram_mode=True,
             )
+            downloaded_dinov2 = _prepare_dinov2_dependency(model, hub_cache)
             model.to("cuda")
             model.eval()
+        except WorkerError:
+            raise
         except Exception as exc:
             raise WorkerError("model-load", f"Could not load the bundled SPAR3D model: {exc}") from exc
 
@@ -634,7 +727,10 @@ def _run_job(job: Job) -> Path:
             },
             "reconstruction": {
                 "engine": "SPAR3D",
-                "offline": True,
+                "offline_after_first_run": True,
+                "dinov2_downloaded_this_run": downloaded_dinov2,
+                "dinov2_repository": DINO_REPOSITORY,
+                "dinov2_revision": DINO_REVISION,
                 "vendor_path": "app/vendor/stable-point-aware-3d",
                 "model_path": "models/spar3d",
                 "model_config": MODEL_CONFIG_NAME,
@@ -696,6 +792,9 @@ def _self_test() -> int:
         (ROBLOX_VERTEX_TARGETS == {"balanced": 10_000, "high": 25_000}, "Roblox targets"),
         (VENDOR_ROOT == APP_ROOT / "vendor" / "stable-point-aware-3d", "vendor path"),
         (MODEL_ROOT == BUNDLE_ROOT / "models" / "spar3d", "model path"),
+        (DINO_REPOSITORY == "facebook/dinov2-large", "DINOv2 repository"),
+        (len(DINO_REVISION) == 40, "DINOv2 revision"),
+        (len(DINO_WEIGHT_SHA256) == 64, "DINOv2 weight digest"),
         (
             BACKGROUND_CHECKPOINT
             == BUNDLE_ROOT / "models" / "transparent-background" / "ckpt_base.pth",
