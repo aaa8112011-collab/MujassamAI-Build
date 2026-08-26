@@ -1347,26 +1347,15 @@ namespace MujassamInstaller
 
         private static string CreateWritableStagingRoot(string installParent)
         {
+            // Keep staging beside the final install so Directory.Move stays on one volume.
+            // The deliberately short, non-hidden name leaves MAX_PATH room for deep Python files.
             string stagingParent = installParent;
-            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (!String.IsNullOrWhiteSpace(local))
-            {
-                string localStageParent = Path.Combine(local, "MujassamAI", "InstallerStage");
-                string installDrive = Path.GetPathRoot(Path.GetFullPath(installParent));
-                string localDrive = Path.GetPathRoot(Path.GetFullPath(localStageParent));
-                if (!String.IsNullOrWhiteSpace(installDrive) &&
-                    String.Equals(installDrive, localDrive, StringComparison.OrdinalIgnoreCase))
-                {
-                    stagingParent = localStageParent;
-                }
-            }
-
             Directory.CreateDirectory(stagingParent);
             Exception lastError = null;
             for (int attempt = 0; attempt < 3; attempt++)
             {
                 string candidate = Path.Combine(stagingParent,
-                    "MujassamAI-Installing-" + Guid.NewGuid().ToString("N").Substring(0, 12));
+                    "MAI-" + Guid.NewGuid().ToString("N").Substring(0, 8));
                 EnsureLegacyPathLength(candidate, true);
                 try
                 {
