@@ -356,8 +356,20 @@ def _import_runtime(bundle: BundlePaths) -> dict[str, Any]:
     except Exception as exc:
         raise WorkerError("runtime-import", f"Bundled 3D runtime could not load: {exc}") from exc
 
-    spar3d_source = Path(spar3d.__file__).resolve(strict=True)
-    if not _is_within(spar3d_source, bundle.vendor_root):
+    # Upstream SPAR3D intentionally has no spar3d/__init__.py, so Python loads
+    # it as a namespace package and spar3d.__file__ is None.  Validate its
+    # namespace search location instead of treating it like a regular module.
+    expected_package_root = (bundle.vendor_root / "spar3d").resolve(strict=True)
+    try:
+        package_locations = {
+            Path(entry).resolve(strict=True)
+            for entry in getattr(spar3d, "__path__", ())
+        }
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise WorkerError(
+            "vendor-invalid", "SPAR3D namespace location could not be validated"
+        ) from exc
+    if package_locations != {expected_package_root}:
         raise WorkerError(
             "vendor-shadowed", "SPAR3D was imported from outside the pinned vendor directory"
         )
