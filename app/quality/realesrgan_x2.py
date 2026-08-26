@@ -329,7 +329,12 @@ class RealESRGANx2:
         tile = tile.to(device=self.device, dtype=dtype, non_blocking=True)
         with torch.inference_mode():
             result = self.model(tile)
-        return result.detach().float().clamp_(0.0, 1.0).cpu()
+        # Outputs created by inference_mode are inference tensors.  PyTorch
+        # deliberately forbids mutating them after leaving the context, even
+        # for harmless post-processing such as clamp_.  Keep every operation
+        # out-of-place so the same path works in both the CPU self-test and the
+        # packaged CUDA runtime.
+        return result.detach().float().clamp(0.0, 1.0).cpu()
 
     def _infer_tiled(self, image: Tensor, tile_size: int, tile_pad: int) -> np.ndarray:
         _, _, height, width = image.shape
@@ -356,8 +361,8 @@ class RealESRGANx2:
                 prediction = prediction[0, :, crop_y0:crop_y1, crop_x0:crop_x1]
                 pixels = (
                     prediction.permute(1, 2, 0)
-                    .mul_(255.0)
-                    .round_()
+                    .mul(255.0)
+                    .round()
                     .to(torch.uint8)
                     .numpy()
                 )
