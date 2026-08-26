@@ -3,8 +3,9 @@
 
 The worker accepts one JSON request file and communicates with the launcher only
 through the line-oriented MJ* protocol on stdout.  The gated SPAR3D model and
-vendor source are always loaded from the application bundle.  SPAR3D's public
-DINOv2 dependency is downloaded once into LocalAppData, pinned, and reused.
+vendor source are always loaded from the application bundle.  DINOv2 is
+initialized locally from the copy embedded in the SPAR3D checkpoint, with a
+pinned public download retained only as a compatibility fallback.
 """
 
 from __future__ import annotations
@@ -51,6 +52,25 @@ DINO_REVISION = "0ff9d1340c9524c60f3f03e8573c57a1f8197f24"
 DINO_WEIGHT_SHA256 = "399fba97a95f22c36834418bc69373364a99af3a1153da1c0fb31db567c92e23"
 HUB_DOWNLOAD_TIMEOUT_SECONDS = 300
 HUB_ETAG_TIMEOUT_SECONDS = 60
+MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024
+DINO_CONFIG_KWARGS = {
+    "attention_probs_dropout_prob": 0.0,
+    "drop_path_rate": 0.0,
+    "hidden_act": "gelu",
+    "hidden_dropout_prob": 0.0,
+    "hidden_size": 1024,
+    "image_size": 518,
+    "initializer_range": 0.02,
+    "layer_norm_eps": 1e-6,
+    "layerscale_value": 1.0,
+    "mlp_ratio": 4,
+    "num_attention_heads": 16,
+    "num_channels": 3,
+    "num_hidden_layers": 24,
+    "patch_size": 14,
+    "qkv_bias": True,
+    "use_swiglu_ffn": False,
+}
 
 _SENSITIVE_PATTERN = re.compile(
     r"(?i)(?:hf_[a-z0-9]{12,}|bearer\s+[a-z0-9._~+/=-]{12,}|"
@@ -345,11 +365,77 @@ def _configure_runtime_environment(bundle: BundlePaths) -> Path:
     return hub_cache
 
 
-def _prepare_dinov2_dependency(model: Any, hub_cache: Path) -> bool:
-    """Resolve the pinned public DINOv2 snapshot and point SPAR3D at it.
+def _safetensors_keys(path: Path) -> set[str]:
+    try:
+        with path.open("rb") as stream:
+            raw_length = stream.read(8)
+            if len(raw_length) != 8:
+                raise ValueError("missing header length")
+            header_length = int.from_bytes(raw_length, "little", signed=False)
+            if not 2 <= header_length <= MAX_SAFETENSORS_HEADER_BYTES:
+                raise ValueError("invalid header length")
+            raw_header = stream.read(header_length)
+            if len(raw_header) != header_length:
+                raise ValueError("incomplete header")
+        header = json.loads(raw_header.decode("utf-8"))
+        if not isinstance(header, dict):
+            raise ValueError("header is not an object")
+        return {str(key) for key in header if key != "__metadata__"}
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise WorkerError(
+            "model-header", f"Could not inspect the bundled SPAR3D checkpoint: {exc}"
+        ) from exc
 
-    Returns True when the weight file had to be downloaded during this run.
+
+def _checkpoint_embeds_dinov2(path: Path) -> bool:
+    keys = _safetensors_keys(path)
+    required_tails = (
+        "model.embeddings.cls_token",
+        "model.embeddings.position_embeddings",
+        "model.embeddings.patch_embeddings.projection.weight",
+        "model.encoder.layer.23.attention.attention.query.weight",
+        "model.layernorm.weight",
+    )
+    for root in ("image_tokenizer", "pdiff_image_tokenizer"):
+        if not all(
+            any(key.endswith(f"{root}.{tail}") for key in keys)
+            for tail in required_tails
+        ):
+            return False
+    return True
+
+
+def _install_embedded_dinov2_loader(runtime: dict[str, Any]) -> None:
+    Dinov2Model = runtime["Dinov2Model"]
+    Dinov2Config = runtime["Dinov2Config"]
+    original_from_pretrained = Dinov2Model.from_pretrained
+
+    def local_from_pretrained(
+        cls: Any, pretrained_model_name_or_path: object, *args: Any, **kwargs: Any
+    ) -> Any:
+        if str(pretrained_model_name_or_path) == DINO_REPOSITORY:
+            return cls(Dinov2Config(**DINO_CONFIG_KWARGS))
+        return original_from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+    Dinov2Model.from_pretrained = classmethod(local_from_pretrained)
+
+
+def _prepare_dinov2_dependency(
+    model: Any,
+    hub_cache: Path,
+    bundle: BundlePaths,
+    runtime: dict[str, Any],
+) -> str:
+    """Use checkpoint-embedded DINOv2, or resolve the pinned public snapshot.
+
+    Returns the source used for the DINOv2 initialization weights.
     """
+
+    if _checkpoint_embeds_dinov2(bundle.model_weights):
+        _emit_progress(44, "Using DINOv2 weights already included with SPAR3D")
+        _install_embedded_dinov2_loader(runtime)
+        _emit_progress(51, "Bundled DINOv2 helper model is ready")
+        return "embedded-spar3d-checkpoint"
 
     try:
         from huggingface_hub import hf_hub_download
@@ -417,7 +503,7 @@ def _prepare_dinov2_dependency(model: Any, hub_cache: Path) -> bool:
             "dinov2-config", f"Could not configure the local DINOv2 model: {exc}"
         ) from exc
     _emit_progress(51, "DINOv2 helper model is ready")
-    return downloaded
+    return "downloaded" if downloaded else "local-cache"
 
 
 def _sha256(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
@@ -447,8 +533,10 @@ def _import_runtime(bundle: BundlePaths) -> dict[str, Any]:
         from PIL import Image, ImageOps, UnidentifiedImageError
         from spar3d.models.mesh import TRIANGLE_REMESH_AVAILABLE
         from spar3d.system import SPAR3D
+        from spar3d.models.tokenizers.dinov2 import Dinov2Model
         from spar3d.utils import foreground_crop, remove_background
         from transparent_background import Remover
+        from transformers.models.dinov2.configuration_dinov2 import Dinov2Config
         import spar3d
     except Exception as exc:
         raise WorkerError("runtime-import", f"Bundled 3D runtime could not load: {exc}") from exc
@@ -476,6 +564,8 @@ def _import_runtime(bundle: BundlePaths) -> dict[str, Any]:
         "ImageOps": ImageOps,
         "UnidentifiedImageError": UnidentifiedImageError,
         "SPAR3D": SPAR3D,
+        "Dinov2Model": Dinov2Model,
+        "Dinov2Config": Dinov2Config,
         "foreground_crop": foreground_crop,
         "remove_background": remove_background,
         "Remover": Remover,
@@ -659,7 +749,9 @@ def _run_job(job: Job) -> Path:
                 weight_name=MODEL_WEIGHT_NAME,
                 low_vram_mode=True,
             )
-            downloaded_dinov2 = _prepare_dinov2_dependency(model, hub_cache)
+            dinov2_source = _prepare_dinov2_dependency(
+                model, hub_cache, bundle, runtime
+            )
             model.to("cuda")
             model.eval()
         except WorkerError:
@@ -734,8 +826,9 @@ def _run_job(job: Job) -> Path:
             },
             "reconstruction": {
                 "engine": "SPAR3D",
-                "offline_after_first_run": True,
-                "dinov2_downloaded_this_run": downloaded_dinov2,
+                "offline": dinov2_source != "downloaded",
+                "dinov2_downloaded_this_run": dinov2_source == "downloaded",
+                "dinov2_source": dinov2_source,
                 "dinov2_repository": DINO_REPOSITORY,
                 "dinov2_revision": DINO_REVISION,
                 "vendor_path": "app/vendor/stable-point-aware-3d",
@@ -804,6 +897,9 @@ def _self_test() -> int:
         (len(DINO_WEIGHT_SHA256) == 64, "DINOv2 weight digest"),
         (HUB_DOWNLOAD_TIMEOUT_SECONDS == 300, "download timeout"),
         (HUB_ETAG_TIMEOUT_SECONDS == 60, "metadata timeout"),
+        (MAX_SAFETENSORS_HEADER_BYTES == 64 * 1024 * 1024, "model header limit"),
+        (DINO_CONFIG_KWARGS.get("hidden_size") == 1024, "DINOv2 hidden size"),
+        (DINO_CONFIG_KWARGS.get("num_hidden_layers") == 24, "DINOv2 layers"),
         (
             BACKGROUND_CHECKPOINT
             == BUNDLE_ROOT / "models" / "transparent-background" / "ckpt_base.pth",
