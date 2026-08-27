@@ -93,6 +93,63 @@ function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Assert-NormalDirectory([string]$Path, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "$Label غير موجود: $Path"
+    }
+    $Item = Get-Item -LiteralPath $Path -Force
+    if (-not $Item.PSIsContainer -or
+        ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "$Label يجب أن يكون مجلدًا عاديًا وليس reparse point: $Path"
+    }
+}
+
+function Assert-WritableDirectory([string]$Path, [string]$Label) {
+    Assert-NormalDirectory $Path $Label
+    $ProbePath = Join-Path $Path (
+        "MujassamAI-write-probe-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+    $ProbeStream = $null
+    try {
+        $ProbeStream = [IO.File]::Open(
+            $ProbePath, [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $ProbeStream.WriteByte(0)
+    } catch {
+        throw "$Label غير قابل للكتابة: $Path. $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $ProbeStream) {
+            $ProbeStream.Dispose()
+        }
+        if (Test-Path -LiteralPath $ProbePath -PathType Leaf) {
+            [IO.File]::Delete($ProbePath)
+        }
+    }
+}
+
+function Remove-SafeStagingDirectory([string]$Path, [string]$TemporaryRoot) {
+    $TemporaryRootFull = [IO.Path]::GetFullPath($TemporaryRoot).TrimEnd('\')
+    $PathFull = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if (-not [string]::Equals(
+        [IO.Path]::GetDirectoryName($PathFull), $TemporaryRootFull,
+        [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($PathFull) -notmatch
+            '^MujassamAI-hy21-install-[0-9a-f]{32}$') {
+        throw "رُفض تنظيف مسار تجهيز غير متوقع: $PathFull"
+    }
+    if (-not (Test-Path -LiteralPath $PathFull)) {
+        return
+    }
+    Assert-NormalDirectory $PathFull "مجلد تجهيز المثبّت"
+    $UnsafeItems = @(Get-ChildItem -LiteralPath $PathFull -Recurse -Force |
+        Where-Object {
+            $_.Attributes -band [IO.FileAttributes]::ReparsePoint
+        })
+    if ($UnsafeItems.Count -ne 0) {
+        throw "رُفض تنظيف مجلد تجهيز يحتوي reparse point: $($UnsafeItems[0].FullName)"
+    }
+    [IO.Directory]::Delete($PathFull, $true)
+}
+
 if ($PSVersionTable.PSVersion.Major -lt 7 -or -not $IsWindows -or
     -not [Environment]::Is64BitOperatingSystem -or
     -not [Environment]::Is64BitProcess) {
@@ -137,6 +194,7 @@ $RunningMujassam = @(Get-Process -Name "MujassamAI" -ErrorAction SilentlyContinu
 if ($RunningMujassam.Count -ne 0) {
     throw "أغلق MujassamAI.exe بالكامل ثم أعد التثبيت."
 }
+Assert-WritableDirectory $RootPath "مجلد MujassamAI-Portable"
 
 $BasePython = Get-ContainedPath $RootPath "rt/python.exe"
 $AbiProbeText = & $BasePython -I -X utf8 -c `
@@ -162,9 +220,20 @@ $ArchiveSha256 = Get-Sha256 $ZipPath
 if ($ArchiveSha256 -cne $ExpectedSha256.ToLowerInvariant()) {
     throw "بصمة ZIP لا تطابق SHA-256 الموثوق الذي مرره المشغّل."
 }
+$InstallerTemporaryRoot = [IO.Path]::GetFullPath(
+    [IO.Path]::GetTempPath()).TrimEnd('\')
+Assert-WritableDirectory $InstallerTemporaryRoot "مجلد Windows المؤقت"
+$StagingRoot = Join-Path $InstallerTemporaryRoot (
+    "MujassamAI-hy21-install-" + [Guid]::NewGuid().ToString("N"))
+if (-not [string]::Equals(
+    [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($StagingRoot)),
+    $InstallerTemporaryRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "مسار تجهيز المثبّت ليس داخل مجلد Windows المؤقت."
+}
+if (Test-Path -LiteralPath $StagingRoot) {
+    throw "مسار تجهيز المثبّت موجود مسبقًا بصورة غير متوقعة: $StagingRoot"
+}
 $Archive = [IO.Compression.ZipFile]::OpenRead($ZipPath)
-$StagingRoot = Join-Path ([IO.Path]::GetDirectoryName($RootPath)) (
-    ".MujassamAI-hy21-staging-" + [Guid]::NewGuid().ToString("N"))
 $StagingCreated = $false
 $ExtractionSucceeded = $false
 try {
@@ -209,8 +278,10 @@ try {
         throw "ZIP لا يحتوي update-manifest.json في الجذر."
     }
 
-    New-Item -ItemType Directory -Path $StagingRoot | Out-Null
+    [IO.Directory]::CreateDirectory($StagingRoot) | Out-Null
     $StagingCreated = $true
+    Assert-NoReparsePointInExistingPath $InstallerTemporaryRoot $StagingRoot
+    Assert-WritableDirectory $StagingRoot "مجلد تجهيز المثبّت"
     foreach ($Entry in $Archive.Entries) {
         $EntryPath = $Entry.FullName.Replace('\', '/').TrimEnd('/')
         if ([string]::IsNullOrWhiteSpace($EntryPath)) {
@@ -218,11 +289,15 @@ try {
         }
         $Destination = Get-ContainedPath $StagingRoot $EntryPath
         if ([string]::IsNullOrEmpty($Entry.Name)) {
-            New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+            Assert-NoReparsePointInExistingPath $StagingRoot $Destination
+            [IO.Directory]::CreateDirectory($Destination) | Out-Null
+            Assert-NoReparsePointInExistingPath $StagingRoot $Destination
             continue
         }
         $Parent = [IO.Path]::GetDirectoryName($Destination)
-        New-Item -ItemType Directory -Path $Parent -Force | Out-Null
+        Assert-NoReparsePointInExistingPath $StagingRoot $Parent
+        [IO.Directory]::CreateDirectory($Parent) | Out-Null
+        Assert-NoReparsePointInExistingPath $StagingRoot $Parent
         $Input = $Entry.Open()
         try {
             $Output = [IO.File]::Open(
@@ -237,12 +312,23 @@ try {
             $Input.Dispose()
         }
     }
+    $UnsafeStagingItems = @(Get-ChildItem -LiteralPath $StagingRoot -Recurse -Force |
+        Where-Object {
+            $_.Attributes -band [IO.FileAttributes]::ReparsePoint
+        })
+    if ($UnsafeStagingItems.Count -ne 0) {
+        throw "مجلد التجهيز يحتوي reparse point غير مسموح."
+    }
     $ExtractionSucceeded = $true
 } finally {
     $Archive.Dispose()
     if (-not $ExtractionSucceeded -and $StagingCreated -and
         (Test-Path -LiteralPath $StagingRoot)) {
-        Remove-Item -LiteralPath $StagingRoot -Recurse -Force
+        try {
+            Remove-SafeStagingDirectory $StagingRoot $InstallerTemporaryRoot
+        } catch {
+            Write-Warning "تعذر تنظيف مجلد التجهيز: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -338,21 +424,27 @@ try {
         throw "ENGINE-MANIFEST داخل التحديث لا يطابق ABI/source المثبت."
     }
 
-    $BackupParent = Join-Path ([IO.Path]::GetDirectoryName($RootPath)) `
-        "MujassamAI-Backups"
-    if (Test-Path -LiteralPath $BackupParent) {
-        $BackupParentItem = Get-Item -LiteralPath $BackupParent -Force
-        if (-not $BackupParentItem.PSIsContainer -or
-            ($BackupParentItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            throw "مجلد النسخ الاحتياطية ليس مجلدًا عاديًا: $BackupParent"
-        }
-    } else {
-        New-Item -ItemType Directory -Path $BackupParent | Out-Null
+    $LocalApplicationData = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::LocalApplicationData)
+    if ([string]::IsNullOrWhiteSpace($LocalApplicationData)) {
+        throw "تعذر تحديد مجلد LocalAppData للنسخ الاحتياطية."
     }
+    $LocalApplicationData = [IO.Path]::GetFullPath($LocalApplicationData).TrimEnd('\')
+    Assert-NormalDirectory $LocalApplicationData "مجلد LocalAppData"
+    $BackupParent = Join-Path $LocalApplicationData "MujassamAI\Backups"
+    Assert-NoReparsePointInExistingPath $LocalApplicationData $BackupParent
+    [IO.Directory]::CreateDirectory($BackupParent) | Out-Null
+    Assert-NoReparsePointInExistingPath $LocalApplicationData $BackupParent
+    Assert-WritableDirectory $BackupParent "مجلد النسخ الاحتياطية"
     $BackupRoot = Join-Path $BackupParent (
         "hunyuan21-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ") +
         "-" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
-    New-Item -ItemType Directory -Path $BackupRoot | Out-Null
+    if (Test-Path -LiteralPath $BackupRoot) {
+        throw "مسار النسخة الاحتياطية موجود مسبقًا: $BackupRoot"
+    }
+    Assert-NoReparsePointInExistingPath $LocalApplicationData $BackupRoot
+    [IO.Directory]::CreateDirectory($BackupRoot) | Out-Null
+    Assert-NoReparsePointInExistingPath $LocalApplicationData $BackupRoot
 
     $Overwritten = [Collections.Generic.List[object]]::new()
     $Created = [Collections.Generic.List[object]]::new()
@@ -365,9 +457,11 @@ try {
                 throw "مسار الهدف موجود لكنه ليس ملفًا: $Relative"
             }
             $BackupFile = Get-ContainedPath $BackupRoot $Relative
-            New-Item -ItemType Directory -Path `
-                ([IO.Path]::GetDirectoryName($BackupFile)) -Force | Out-Null
-            Copy-Item -LiteralPath $Destination -Destination $BackupFile
+            $BackupFileParent = [IO.Path]::GetDirectoryName($BackupFile)
+            Assert-NoReparsePointInExistingPath $BackupRoot $BackupFileParent
+            [IO.Directory]::CreateDirectory($BackupFileParent) | Out-Null
+            Assert-NoReparsePointInExistingPath $BackupRoot $BackupFileParent
+            [IO.File]::Copy($Destination, $BackupFile, $false)
             $Original = Get-Item -LiteralPath $Destination
             $OriginalHash = Get-Sha256 $Destination
             if ((Get-Sha256 $BackupFile) -cne $OriginalHash) {
@@ -414,13 +508,13 @@ try {
             $Destination = Get-ContainedPath $RootPath $Relative
             Assert-NoReparsePointInExistingPath $RootPath $Destination
             $DestinationParent = [IO.Path]::GetDirectoryName($Destination)
-            New-Item -ItemType Directory -Path $DestinationParent -Force | Out-Null
+            [IO.Directory]::CreateDirectory($DestinationParent) | Out-Null
             Assert-NoReparsePointInExistingPath $RootPath $DestinationParent
             $TemporaryDestination = Join-Path $DestinationParent (
-                ".mujassam-new-" + [Guid]::NewGuid().ToString("N"))
-            Copy-Item -LiteralPath $Source -Destination $TemporaryDestination
+                "MujassamAI-new-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+            [IO.File]::Copy($Source, $TemporaryDestination, $false)
             if ((Get-Sha256 $TemporaryDestination) -cne [string]$Entry.sha256) {
-                Remove-Item -LiteralPath $TemporaryDestination -Force
+                [IO.File]::Delete($TemporaryDestination)
                 throw "فشل تحقق النسخة المؤقتة قبل الاستبدال: $Relative"
             }
             $Existed = Test-Path -LiteralPath $Destination -PathType Leaf
@@ -459,8 +553,9 @@ try {
                     }
                     $Parent = [IO.Path]::GetDirectoryName($Destination)
                     $RollbackTemporary = Join-Path $Parent (
-                        ".mujassam-rollback-" + [Guid]::NewGuid().ToString("N"))
-                    Copy-Item -LiteralPath $BackupFile -Destination $RollbackTemporary
+                        "MujassamAI-rollback-" +
+                        [Guid]::NewGuid().ToString("N") + ".tmp")
+                    [IO.File]::Copy($BackupFile, $RollbackTemporary, $false)
                     try {
                         if ((Get-Sha256 $RollbackTemporary) -cne
                             [string]$OriginalEntry.sha256) {
@@ -475,7 +570,7 @@ try {
                         }
                     } finally {
                         if (Test-Path -LiteralPath $RollbackTemporary) {
-                            Remove-Item -LiteralPath $RollbackTemporary -Force
+                            [IO.File]::Delete($RollbackTemporary)
                         }
                     }
                     if ((Get-Sha256 $Destination) -cne
@@ -488,7 +583,7 @@ try {
                         throw "تغيّر الملف الجديد قبل الاسترجاع؛ لم يُحذف"
                     }
                     Assert-NoReparsePointInExistingPath $RootPath $Destination
-                    Remove-Item -LiteralPath $Destination -Force
+                    [IO.File]::Delete($Destination)
                     if (Test-Path -LiteralPath $Destination) {
                         throw "تعذر حذف الملف الذي أضافه التحديث"
                     }
@@ -531,6 +626,10 @@ try {
     Write-Host "لا يستخدم هذا المثبّت GitHub Release ولا ينزّل أي ملف."
 } finally {
     if ($StagingCreated -and (Test-Path -LiteralPath $StagingRoot)) {
-        Remove-Item -LiteralPath $StagingRoot -Recurse -Force
+        try {
+            Remove-SafeStagingDirectory $StagingRoot $InstallerTemporaryRoot
+        } catch {
+            Write-Warning "تعذر تنظيف مجلد التجهيز: $($_.Exception.Message)"
+        }
     }
 }

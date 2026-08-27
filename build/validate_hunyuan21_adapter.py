@@ -528,9 +528,27 @@ def main() -> int:
         and "provider_legal_name" in local_installer
         and '"2.5.1+cu124"' in local_installer
         and '"0.20.1+cu124"' in local_installer
-        and "MujassamAI-Backups" in local_installer
+        and "[Environment+SpecialFolder]::LocalApplicationData" in local_installer
+        and '"MujassamAI\\Backups"' in local_installer
         and "update-manifest.json" in local_installer,
         "Offline installer lacks scope, ABI, manifest, or backup enforcement",
+    )
+    require(
+        "$InstallerTemporaryRoot = [IO.Path]::GetFullPath(" in local_installer
+        and "[IO.Path]::GetTempPath()).TrimEnd" in local_installer
+        and '"MujassamAI-hy21-install-"' in local_installer
+        and "[IO.Directory]::CreateDirectory($StagingRoot)" in local_installer
+        and "Assert-WritableDirectory $InstallerTemporaryRoot" in local_installer
+        and "Remove-SafeStagingDirectory $StagingRoot" in local_installer
+        and "Assert-WritableDirectory $RootPath" in local_installer,
+        "Offline installer must use verified writable roots and constrained cleanup",
+    )
+    require(
+        all(
+            provider_mutation not in local_installer
+            for provider_mutation in ("New-Item", "Copy-Item", "Remove-Item")
+        ),
+        "Offline installer filesystem mutations must use explicit .NET APIs",
     )
     require(
         "install-receipt.json" in local_restore

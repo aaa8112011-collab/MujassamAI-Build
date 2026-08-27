@@ -49,7 +49,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\installer\install-hunyuan21-loca
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\installer\restore-hunyuan21-local.ps1 `
-  -BackupRoot "$env:USERPROFILE\Documents\MujassamAI-Backups\hunyuan21-..."
+  -BackupRoot "$env:LOCALAPPDATA\MujassamAI\Backups\hunyuan21-..."
 ```
 
 يعرض PowerShell تأكيدًا قبل الاسترجاع، ويتحقق من بصمات ملفات النسخة
