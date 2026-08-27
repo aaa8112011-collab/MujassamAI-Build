@@ -237,6 +237,11 @@ def main() -> int:
         and "result = probe.load(own_path)" in worker_text,
         "Checkpoint guard must preserve pathlib.Path parent directories",
     )
+    require(
+        'kwargs.pop("mmap", None)' in worker_text
+        and "mmap_result = probe.load(str(own_path), mmap=True)" in worker_text,
+        "Checkpoint guard must neutralize mmap and use the verified open handle",
+    )
     preflight = worker_text.find('_validate_base_runtime(payload["texture_mode"])')
     prepare = worker_text.find("image_info = _prepare_image")
     download = worker_text.find("model_root, dino_root, downloaded = _download_models")

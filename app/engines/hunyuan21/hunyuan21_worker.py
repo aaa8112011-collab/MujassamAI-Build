@@ -1589,8 +1589,11 @@ def _force_weights_only_torch_load(
         expected_size, expected_sha256 = specification
         if kwargs.get("weights_only") is False:
             raise RuntimeError("Unsafe torch.load(weights_only=False) was blocked")
-        if kwargs.get("mmap") is True:
-            raise RuntimeError("torch.load mmap was blocked for verified checkpoints")
+        # Transformers 4.46 requests mmap=True for zip-format PyTorch
+        # checkpoints.  mmap cannot preserve the same-open-handle guarantee
+        # below, so neutralize the optimization and continue with the exact
+        # verified handle instead of rejecting an otherwise valid load.
+        kwargs.pop("mmap", None)
         kwargs["weights_only"] = True
         # Hash and deserialize from one already-open handle.  A path can be
         # renamed/replaced after verification; the handle pins the exact bytes
@@ -2119,11 +2122,14 @@ def _weights_only_guard_self_test() -> bool:
             return False
         except RuntimeError:
             pass
-        try:
-            probe.load(str(own_path), mmap=True)
+        mmap_result = probe.load(str(own_path), mmap=True)
+        if (
+            mmap_result.get("weights_only") is not True
+            or "mmap" in mmap_result
+            or not hasattr(probe.source, "read")
+            or not getattr(probe.source, "closed", False)
+        ):
             return False
-        except RuntimeError:
-            pass
         try:
             probe.load(str(BASE_WORKER_PATH))
             return False
