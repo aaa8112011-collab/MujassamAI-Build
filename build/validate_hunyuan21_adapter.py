@@ -448,8 +448,11 @@ def main() -> int:
     require(
         "$TextFile = $_" in build_script
         and "$Text = [IO.File]::ReadAllText($TextFile.FullName)" in build_script
+        and "$MujassamMarkerPattern = '@@MUJASSAM_[A-Z][A-Z0-9_]*@@'"
+        in build_script
+        and "$Text, $MujassamMarkerPattern" in build_script
         and "(Get-Content $_.FullName -Raw)" not in build_script,
-        "Staged marker scan must treat valid empty text files as empty strings",
+        "Staged marker scan must be null-safe and limited to Mujassam placeholders",
     )
     vendor_patch = (ROOT / "build" / "patch_hunyuan21_windows.py").read_text(
         encoding="utf-8"
@@ -468,7 +471,8 @@ def main() -> int:
         and "usage_scope = $UsageScope" in build_script
         and "distribution_authorized = $false" in build_script
         and "provider_legal_name = $ProviderLegalName" in build_script
-        and build_script.count("@@[A-Z][A-Z0-9_]*@@") >= 2
+        and build_script.count("@@[A-Z][A-Z0-9_]*@@") >= 1
+        and "@@MUJASSAM_[A-Z][A-Z0-9_]*@@" in build_script
         and '$MainFormSource.Contains("@@")' not in build_script,
         "Build script does not materialize the personal-local scope safely",
     )
@@ -501,6 +505,9 @@ def main() -> int:
     )
     require(
         "$Text = [IO.File]::ReadAllText($TextFile.FullName)" in local_recovery
+        and "$MujassamMarkerPattern = '@@MUJASSAM_[A-Z][A-Z0-9_]*@@'"
+        in local_recovery
+        and "$Text, $MujassamMarkerPattern" in local_recovery
         and "source_commit = $FailedRepositoryCommit" in local_recovery
         and 'usage_scope = "personal_local_only"' in local_recovery
         and "distribution_authorized = $false" in local_recovery
