@@ -46,6 +46,19 @@ function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Remove-TemporaryFileBestEffort([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    try {
+        if ([IO.File]::Exists($Path)) {
+            [IO.File]::Delete($Path)
+        }
+    } catch {
+        Write-Warning "تعذر حذف الملف المؤقت $Path`: $($_.Exception.Message)"
+    }
+}
+
 function Assert-NoReparsePointInExistingPath([string]$Root, [string]$Candidate) {
     $RootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
     $CandidateFull = [IO.Path]::GetFullPath($Candidate)
@@ -190,10 +203,13 @@ try {
             throw "تغيّر الملف أثناء الاسترجاع؛ لم تتم الكتابة فوقه: $Relative"
         }
         $Parent = [IO.Path]::GetDirectoryName($Destination)
-        New-Item -ItemType Directory -Path $Parent -Force | Out-Null
+        [IO.Directory]::CreateDirectory($Parent) | Out-Null
+        Assert-NoReparsePointInExistingPath $InstallRoot $Parent
         $TemporaryDestination = Join-Path $Parent (
-            ".mujassam-restore-" + [Guid]::NewGuid().ToString("N"))
-        Copy-Item -LiteralPath $BackupFile -Destination $TemporaryDestination
+            "MujassamAI-restore-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        [IO.File]::Copy($BackupFile, $TemporaryDestination, $false)
+        $RestoreReplacementBackup = $null
+        $RestoreSucceeded = $false
         try {
             if ((Get-Sha256 $TemporaryDestination) -cne [string]$Entry.sha256) {
                 throw "فشل تحقق ملف الاسترجاع المؤقت: $Relative"
@@ -202,10 +218,20 @@ try {
             if ((Get-Sha256 $Destination) -cne [string]$Entry.installed_sha256) {
                 throw "تغيّر الملف قبل الاستبدال مباشرة: $Relative"
             }
-            [IO.File]::Replace($TemporaryDestination, $Destination, $null, $true)
+            $RestoreReplacementBackup = Join-Path $Parent (
+                "MujassamAI-restore-replaced-" +
+                [Guid]::NewGuid().ToString("N") + ".tmp")
+            [IO.File]::Replace(
+                $TemporaryDestination, $Destination,
+                $RestoreReplacementBackup, $true)
+            if ((Get-Sha256 $Destination) -cne [string]$Entry.sha256) {
+                throw "فشل فحص الملف مباشرة بعد الاسترجاع: $Relative"
+            }
+            $RestoreSucceeded = $true
         } finally {
-            if (Test-Path -LiteralPath $TemporaryDestination) {
-                Remove-Item -LiteralPath $TemporaryDestination -Force
+            Remove-TemporaryFileBestEffort $TemporaryDestination
+            if ($RestoreSucceeded) {
+                Remove-TemporaryFileBestEffort $RestoreReplacementBackup
             }
         }
     }
@@ -216,7 +242,7 @@ try {
             if ((Get-Sha256 $Destination) -cne [string]$Entry.installed_sha256) {
                 throw "تغيّر الملف قبل الحذف مباشرة: $($Entry.path)"
             }
-            Remove-Item -LiteralPath $Destination -Force
+            [IO.File]::Delete($Destination)
         }
     }
     foreach ($Entry in $Overwritten) {

@@ -551,10 +551,23 @@ def main() -> int:
         "Offline installer filesystem mutations must use explicit .NET APIs",
     )
     require(
+        "$ReplacementBackup, $true" in local_installer
+        and "$RollbackReplacementBackup, $true" in local_installer
+        and "$Destination, $null, $true" not in local_installer
+        and "Remove-TemporaryFileBestEffort" in local_installer,
+        "File.Replace must use explicit same-directory backup paths",
+    )
+    require(
         "install-receipt.json" in local_restore
         and "ShouldProcess" in local_restore
         and "installed_sha256" in local_restore
-        and "Assert-NoReparsePointInExistingPath" in local_restore,
+        and "Assert-NoReparsePointInExistingPath" in local_restore
+        and "$RestoreReplacementBackup, $true" in local_restore
+        and "$Destination, $null, $true" not in local_restore
+        and all(
+            provider_mutation not in local_restore
+            for provider_mutation in ("New-Item", "Copy-Item", "Remove-Item")
+        ),
         "Local restore path lacks receipt, confirmation, hash, or reparse enforcement",
     )
     for forbidden_installer_network in (
