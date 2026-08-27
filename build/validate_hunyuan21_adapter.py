@@ -317,7 +317,6 @@ def main() -> int:
     for forbidden_runtime_package in (
         "basicsr",
         "realesrgan",
-        "pymeshlab",
         "omegaconf",
     ):
         require(
@@ -339,6 +338,7 @@ def main() -> int:
         "opencv-python-headless",
         "pillow",
         "pygltflib",
+        "pymeshlab",
         "pyyaml",
         "safetensors",
         "scikit-image",
@@ -354,6 +354,10 @@ def main() -> int:
     require(
         required_runtime_packages <= set(runtime_requirements),
         "Runtime dependency lock is missing a direct engine package",
+    )
+    require(
+        runtime_requirements["pymeshlab"][1] == "2022.2.post3",
+        "Runtime dependency lock must preserve the pinned upstream PyMeshLab version",
     )
     required_build_pins = {
         "ninja": "1.11.1.3",
