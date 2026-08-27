@@ -14,9 +14,10 @@ pygltflib==1.16.2
 pybind11==2.13.6
 PyYAML==6.0.2
 safetensors==0.4.5
+scikit-image==0.24.0
 scipy==1.14.1
-tokenizers==0.20.3
+tokenizers==0.21.0
 tqdm==4.67.1
-transformers==4.46.3
+transformers==4.48.0
 trimesh==4.4.9
 xatlas==0.0.9
