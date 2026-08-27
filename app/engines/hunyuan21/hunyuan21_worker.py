@@ -454,7 +454,13 @@ def _validate_license_acceptance() -> Path:
 
 
 def _activate_engine_paths() -> None:
-    ordered = (PYTHON_PACKAGES, SHAPE_VENDOR_ROOT, PAINT_VENDOR_ROOT, VENDOR_ROOT)
+    ordered = (
+        APP_ROOT,
+        PYTHON_PACKAGES,
+        SHAPE_VENDOR_ROOT,
+        PAINT_VENDOR_ROOT,
+        VENDOR_ROOT,
+    )
     for path in reversed(ordered):
         value = str(path)
         sys.path[:] = [entry for entry in sys.path if entry != value]

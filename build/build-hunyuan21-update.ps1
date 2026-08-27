@@ -102,12 +102,6 @@ if ($RequireHashedDependencies -and
         "win_amd64 SHA-256 locks for both runtime and build dependencies"
     )
 }
-$RequirementIntegrityArguments = if ($UseHashedRequirements) {
-    @("--require-hashes")
-} else {
-    @()
-}
-
 # Fetching the upstream source is itself use/reproduction under the Hunyuan
 # license.  A full build must therefore fail before network access unless the
 # operator explicitly accepted the current license/AUP and confirmed that this
@@ -369,41 +363,17 @@ Get-ChildItem $StagePaint.FullName -Recurse -File |
 & $BuildPython -I -X utf8 $PatchScript vendor $StageVendor.FullName
 
 Write-Host "Installing isolated Hunyuan3D-2.1 Python dependencies"
-& $BuildPython -m pip install --no-cache-dir --target $PythonPackages.FullName `
-    @RequirementIntegrityArguments -r $Requirements
-
-# RealESRGAN 0.3.0 predates PyTorch's safe checkpoint loader default.  Patch
-# every load site deterministically so the bundled helper never unpickles an
-# object graph from a checkpoint, even outside the worker's process-wide guard.
-$RealEsrganUtils = Join-Path $PythonPackages "realesrgan\utils.py"
-if (-not (Test-Path $RealEsrganUtils -PathType Leaf)) {
-    throw "The pinned RealESRGAN package did not install realesrgan/utils.py"
+if ($UseHashedRequirements) {
+    # The lock is a complete, reviewed wheel closure.  --no-deps prevents pip
+    # from resolving or downloading anything outside those exact artifacts and
+    # avoids installing the base-owned CUDA PyTorch a second time.
+    & $BuildPython -m pip install --no-cache-dir --only-binary=:all: `
+        --no-deps --target $PythonPackages.FullName `
+        --require-hashes -r $Requirements
+} else {
+    & $BuildPython -m pip install --no-cache-dir `
+        --target $PythonPackages.FullName -r $Requirements
 }
-$RealEsrganSource = Get-Content $RealEsrganUtils -Raw
-$SafeLoadPatches = [ordered]@{
-    "        loadnet = torch.load(model_path, map_location=torch.device('cpu'))" = @'
-        # Modified by Mujassam AI: checkpoint tensors only; never unpickle objects.
-        loadnet = torch.load(model_path, map_location=torch.device('cpu'), weights_only=True)
-'@
-    "        net_a = torch.load(net_a, map_location=torch.device(loc))" = @'
-        # Modified by Mujassam AI: checkpoint tensors only; never unpickle objects.
-        net_a = torch.load(net_a, map_location=torch.device(loc), weights_only=True)
-'@
-    "        net_b = torch.load(net_b, map_location=torch.device(loc))" = @'
-        # Modified by Mujassam AI: checkpoint tensors only; never unpickle objects.
-        net_b = torch.load(net_b, map_location=torch.device(loc), weights_only=True)
-'@
-}
-foreach ($Patch in $SafeLoadPatches.GetEnumerator()) {
-    $Count = [regex]::Matches(
-        $RealEsrganSource, [regex]::Escape([string]$Patch.Key)).Count
-    if ($Count -ne 1) {
-        throw "RealESRGAN safe-load source contract changed: $($Patch.Key) ($Count)"
-    }
-    $RealEsrganSource = $RealEsrganSource.Replace($Patch.Key, $Patch.Value.TrimEnd())
-}
-[IO.File]::WriteAllText(
-    $RealEsrganUtils, $RealEsrganSource, [Text.UTF8Encoding]::new($false))
 
 # Engine-local dependencies must never shadow the portable base CUDA PyTorch.
 $AccidentalTorch = @(Get-ChildItem $PythonPackages.FullName -Force | Where-Object {
@@ -523,6 +493,7 @@ vendor = os.path.join(root, "vendor", "Hunyuan3D-2.1")
 sys.path.insert(0, os.path.join(root, "python_packages"))
 sys.path.insert(0, os.path.join(vendor, "hy3dpaint"))
 sys.path.insert(0, os.path.join(vendor, "hy3dshape"))
+sys.path.insert(0, os.path.realpath(os.path.join(root, "..", "..")))
 import torch
 assert torch.__version__ == os.environ["MJ_EXPECTED_TORCH"], torch.__version__
 assert os.path.commonpath((os.path.realpath(torch.__file__), os.path.realpath(root))) != os.path.realpath(root)
@@ -536,11 +507,12 @@ import custom_rasterizer
 from DifferentiableRenderer import mesh_inpaint_processor
 from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
 from hy3dshape.postprocessors import DegenerateFaceRemover, FaceReducer, FloaterRemover
-import basicsr
-from realesrgan import RealESRGANer
-import realesrgan.utils as realesrgan_utils
 import inspect
-assert inspect.getsource(realesrgan_utils).count("weights_only=True") == 3
+from quality.realesrgan_x2 import REALESRGAN_X4PLUS, load_realesrgan_x4plus
+assert REALESRGAN_X4PLUS.sha256 == "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"
+assert "basicsr" not in sys.modules and "realesrgan" not in sys.modules
+from utils.image_super_utils import imageSuperNet
+assert "load_realesrgan_x4plus" in inspect.getsource(imageSuperNet.__init__)
 from textureGenPipeline import Hunyuan3DPaintConfig, Hunyuan3DPaintPipeline
 
 # Exercise the engine's exact checkpoint guard against the packaged PyTorch

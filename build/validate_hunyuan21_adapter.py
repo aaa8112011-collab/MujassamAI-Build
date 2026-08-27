@@ -238,10 +238,14 @@ def main() -> int:
     requirements = (ROOT / "build" / "hunyuan21.requirements.lock.txt").read_text(
         encoding="utf-8"
     )
-    require(
-        re.search(r"(?m)^pymeshlab==2023\.12\.post2$", requirements) is not None,
-        "Shape postprocessors require the pinned pymeshlab Windows package",
-    )
+    for forbidden_runtime_package in ("basicsr", "realesrgan", "pymeshlab"):
+        require(
+            re.search(
+                rf"(?mi)^{re.escape(forbidden_runtime_package)}==", requirements
+            )
+            is None,
+            f"Unused source/GPL runtime package must not be bundled: {forbidden_runtime_package}",
+        )
 
     build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
     acknowledgement_gate = re.search(
@@ -281,6 +285,11 @@ def main() -> int:
         and "pip install --no-cache-dir --require-hashes" in build_script
         and "-r $BuildRequirements" in build_script,
         "Hash-locked builds must cover build tools and PyTorch as well as runtime dependencies",
+    )
+    require(
+        "--no-deps --target $PythonPackages.FullName" in build_script
+        and "load_realesrgan_x4plus" in build_script,
+        "Runtime packaging must use the complete wheel lock and self-contained x4 inference",
     )
 
     workflow = WORKFLOW.read_text(encoding="utf-8")

@@ -7,6 +7,7 @@ already shipped by the portable application.
 
 from .realesrgan_x2 import (
     REALESRGAN_X2PLUS,
+    REALESRGAN_X4PLUS,
     ModelSpec,
     QualityError,
     RealESRGANx2,
@@ -14,6 +15,7 @@ from .realesrgan_x2 import (
     WeightVerificationError,
     blend_ai_with_lanczos,
     load_realesrgan_x2plus,
+    load_realesrgan_x4plus,
     resize_normal_map,
     restore_color_texture,
     self_test,
@@ -22,6 +24,7 @@ from .realesrgan_x2 import (
 
 __all__ = [
     "REALESRGAN_X2PLUS",
+    "REALESRGAN_X4PLUS",
     "ModelSpec",
     "QualityError",
     "RealESRGANx2",
@@ -29,6 +32,7 @@ __all__ = [
     "WeightVerificationError",
     "blend_ai_with_lanczos",
     "load_realesrgan_x2plus",
+    "load_realesrgan_x4plus",
     "resize_normal_map",
     "restore_color_texture",
     "self_test",

@@ -1,0 +1,159 @@
+name: Capture Hunyuan3D 2.1 Windows dependency locks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  capture-windows-locks:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout lock source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Select CPython 3.11.9 x64
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11.9"
+          architecture: x64
+
+      - name: Resolve, hash, and verify Windows wheels
+        id: locks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Root = Join-Path $env:RUNNER_TEMP "hy21-lock-capture"
+          $TorchIndex = "https://download.pytorch.org/whl/cu124"
+          $Helper = Join-Path $env:GITHUB_WORKSPACE "build/materialize_hunyuan21_lock.py"
+          $RuntimeInput = Join-Path $env:GITHUB_WORKSPACE "build/hunyuan21.requirements.lock.txt"
+          New-Item -ItemType Directory -Path $Root | Out-Null
+
+          function New-LockVenv([string]$Name) {
+            $Path = Join-Path $Root $Name
+            python -m venv $Path
+            $Python = Join-Path $Path "Scripts/python.exe"
+            & $Python -m pip install --disable-pip-version-check --no-cache-dir `
+                --only-binary=:all: "pip==24.3.1"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to pin pip in $Name" }
+            return $Python
+          }
+
+          $BuildPython = New-LockVenv "build-env"
+          & $BuildPython -m pip install --disable-pip-version-check --no-cache-dir `
+              --only-binary=:all: `
+              "setuptools==69.5.1" "wheel==0.45.1" `
+              "ninja==1.11.1.3" "pybind11==2.13.6"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to resolve build tools" }
+          & $BuildPython -m pip install --disable-pip-version-check --no-cache-dir `
+              --only-binary=:all: --extra-index-url $TorchIndex `
+              "torch==2.5.1+cu124" "torchvision==0.20.1+cu124"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to resolve pinned CUDA PyTorch" }
+          & $BuildPython -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Build environment dependency check failed" }
+
+          $BuildFreeze = Join-Path $Root "build-freeze.txt"
+          $BuildResolved = Join-Path $Root "build-resolved.txt"
+          $BuildWheelhouse = New-Item -ItemType Directory -Path `
+              (Join-Path $Root "build-wheels")
+          $BuildLock = Join-Path $Root "hunyuan21.build.requirements.lock.txt"
+          @(& $BuildPython -m pip freeze --all) | Set-Content $BuildFreeze -Encoding utf8
+          python $Helper filter --freeze $BuildFreeze --output $BuildResolved `
+              --exclude pip
+          if ($LASTEXITCODE -ne 0) { throw "Failed to filter build resolution" }
+          & $BuildPython -m pip download --disable-pip-version-check --no-cache-dir `
+              --only-binary=:all: --no-deps --dest $BuildWheelhouse.FullName `
+              --extra-index-url $TorchIndex -r $BuildResolved
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download resolved build wheels" }
+          python $Helper lock --resolved $BuildResolved `
+              --wheelhouse $BuildWheelhouse.FullName --output $BuildLock `
+              --title "Mujassam AI Hunyuan3D 2.1 Windows build dependency lock"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to materialize build lock" }
+
+          $RuntimePython = New-LockVenv "runtime-env"
+          & $RuntimePython -m pip install --disable-pip-version-check --no-cache-dir `
+              --only-binary=:all: --extra-index-url $TorchIndex `
+              "torch==2.5.1+cu124" "torchvision==0.20.1+cu124"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to seed runtime ABI" }
+          & $RuntimePython -m pip install --disable-pip-version-check --no-cache-dir `
+              --only-binary=:all: -r $RuntimeInput
+          if ($LASTEXITCODE -ne 0) { throw "Failed to resolve runtime dependencies as wheels" }
+          & $RuntimePython -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Runtime environment dependency check failed" }
+
+          $RuntimeFreeze = Join-Path $Root "runtime-freeze.txt"
+          $RuntimeResolved = Join-Path $Root "runtime-resolved.txt"
+          $RuntimeWheelhouse = New-Item -ItemType Directory -Path `
+              (Join-Path $Root "runtime-wheels")
+          $RuntimeLock = Join-Path $Root "hunyuan21.requirements.lock.txt"
+          @(& $RuntimePython -m pip freeze --all) | Set-Content $RuntimeFreeze -Encoding utf8
+          python $Helper filter --freeze $RuntimeFreeze --output $RuntimeResolved `
+              --exclude pip --exclude setuptools --exclude wheel `
+              --exclude torch --exclude torchvision --exclude torchaudio `
+              --exclude torchgen --exclude functorch --exclude sympy `
+              --exclude ninja --exclude pybind11
+          if ($LASTEXITCODE -ne 0) { throw "Failed to filter runtime resolution" }
+          & $RuntimePython -m pip download --disable-pip-version-check --no-cache-dir `
+              --only-binary=:all: --no-deps --dest $RuntimeWheelhouse.FullName `
+              -r $RuntimeResolved
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download resolved runtime wheels" }
+          python $Helper lock --resolved $RuntimeResolved `
+              --wheelhouse $RuntimeWheelhouse.FullName --output $RuntimeLock `
+              --title "Mujassam AI Hunyuan3D 2.1 CPython 3.11 win_amd64 runtime lock"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to materialize runtime lock" }
+
+          $VerifyPython = New-LockVenv "verify-env"
+          & $VerifyPython -m pip install --disable-pip-version-check --no-cache-dir `
+              --only-binary=:all: --require-hashes --extra-index-url $TorchIndex `
+              -r $BuildLock
+          if ($LASTEXITCODE -ne 0) { throw "Build hash-lock replay failed" }
+          & $VerifyPython -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Replayed build lock is inconsistent" }
+
+          $RuntimeTarget = Join-Path $Root "runtime-target"
+          & $VerifyPython -m pip install --disable-pip-version-check --no-cache-dir `
+              --only-binary=:all: --no-deps --require-hashes `
+              --target $RuntimeTarget -r $RuntimeLock
+          if ($LASTEXITCODE -ne 0) { throw "Runtime hash-lock replay failed" }
+          $env:PYTHONPATH = $RuntimeTarget
+          & $VerifyPython -I -X utf8 -c `
+              "import sys; sys.path.insert(0, r'$RuntimeTarget'); import accelerate, cv2, diffusers, numpy, omegaconf, PIL, pygltflib, pymeshlab, safetensors, scipy, skimage, timm, tokenizers, torchdiffeq, transformers, trimesh, xatlas, yaml; print('HY21_WINDOWS_LOCKS_OK')"
+          if ($LASTEXITCODE -ne 0) { throw "Runtime wheel import smoke test failed" }
+
+          $RuntimeBase64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($RuntimeLock))
+          $BuildBase64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($BuildLock))
+          "runtime=$RuntimeBase64" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "build=$BuildBase64" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Return verified locks to this pull request
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUNTIME_LOCK: ${{ steps.locks.outputs.runtime }}
+          BUILD_LOCK: ${{ steps.locks.outputs.build }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:PR_NUMBER -notmatch '^[1-9][0-9]*$') {
+            throw "Invalid pull request number"
+          }
+          $Body = @(
+            "<!-- hy21-lock-capture -->",
+            "Verified on windows-2022 / CPython 3.11.9 x64.",
+            "RUNTIME_LOCK_BASE64=$($env:RUNTIME_LOCK)",
+            "BUILD_LOCK_BASE64=$($env:BUILD_LOCK)"
+          ) -join "`n"
+          $Payload = @{ body = $Body } | ConvertTo-Json -Compress
+          $Headers = @{
+            Authorization = "Bearer $($env:GH_TOKEN)"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $Uri = "$($env:GITHUB_API_URL)/repos/$($env:GITHUB_REPOSITORY)/issues/$($env:PR_NUMBER)/comments"
+          Invoke-RestMethod -Method Post -Uri $Uri -Headers $Headers `
+              -ContentType "application/json" -Body $Payload | Out-Null
