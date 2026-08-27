@@ -63,6 +63,7 @@ jobs:
           foreach ($ScriptPath in @(
             "build/build-hunyuan21-update.ps1",
             "build/build-hunyuan21-local.ps1",
+            "build/resume-hunyuan21-local.ps1",
             "installer/install-hunyuan21-local.ps1",
             "installer/restore-hunyuan21-local.ps1"
           )) {

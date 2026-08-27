@@ -705,12 +705,16 @@ $TextExtensions = @(".py", ".json", ".txt", ".md", ".yaml", ".yml", ".manifest")
 $UnresolvedMarkerDetails = @(Get-ChildItem $Stage -Recurse -File | Where-Object {
     $_.Extension.ToLowerInvariant() -in $TextExtensions
 } | ForEach-Object {
+    $TextFile = $_
+    # Get-Content -Raw returns $null for a valid empty file.  ReadAllText
+    # preserves it as an empty string so the marker scan remains well-defined.
+    $Text = [IO.File]::ReadAllText($TextFile.FullName)
     $MarkerMatches = @([regex]::Matches(
-        (Get-Content $_.FullName -Raw), '@@[A-Z][A-Z0-9_]*@@') |
+        $Text, '@@[A-Z][A-Z0-9_]*@@') |
         ForEach-Object { $_.Value } |
         Sort-Object -Unique)
     if ($MarkerMatches.Count -ne 0) {
-        "$($_.FullName): $($MarkerMatches -join ', ')"
+        "$($TextFile.FullName): $($MarkerMatches -join ', ')"
     }
 })
 if ($UnresolvedMarkerDetails.Count -ne 0) {
@@ -744,9 +748,11 @@ $ManifestJson = $UpdateManifest | ConvertTo-Json -Depth 6
     (Join-Path $Stage "update-manifest.json"),
     $ManifestJson,
     [Text.UTF8Encoding]::new($false))
+Write-Host "Creating the verified Hunyuan3D-2.1 update ZIP"
 Compress-Archive -Path (Join-Path $Stage "*") `
     -DestinationPath $Archive -CompressionLevel Optimal
 
+Write-Host "Verifying every file in the completed update ZIP"
 Expand-Archive -Path $Archive -DestinationPath $VerifyRoot
 $ExtractedManifest = Get-Content `
     (Join-Path $VerifyRoot "update-manifest.json") -Raw | ConvertFrom-Json
