@@ -40,6 +40,9 @@ PAINT_SUBFOLDER = "hunyuan3d-paint-v2-0-turbo"
 DELIGHT_SUBFOLDER = "hunyuan3d-delight-v2-0"
 MIN_FREE_DOWNLOAD_BYTES = 24 * 1024**3
 MAX_DOWNLOAD_ATTEMPTS = 6
+DOWNLOAD_STALL_SECONDS = 180
+DOWNLOAD_POLL_SECONDS = 5
+DOWNLOAD_STATUS_SECONDS = 30
 ROBLOX_READY_FACES = 20_000
 ROBLOX_MASTER_FACES = 100_000
 MAX_IMAGE_PIXELS = 100_000_000
@@ -383,26 +386,228 @@ def _install_trusted_paint_unet_module(root: Path) -> None:
         ) from exc
 
 
-def _download_snapshot_resumable(
-    snapshot_download: Any,
+def _download_patterns(repo_id: str) -> tuple[list[str], list[str]]:
+    common_ignore = ["*.ckpt", "*.pt", "*.pth", "*.pkl"]
+    if repo_id == SHAPE_REPOSITORY:
+        return (
+            [
+                f"{SHAPE_SUBFOLDER}/config.yaml",
+                f"{SHAPE_SUBFOLDER}/model.fp16.safetensors",
+                "LICENSE",
+                "NOTICE",
+                "README.md",
+            ],
+            common_ignore,
+        )
+    if repo_id == PAINT_REPOSITORY:
+        return (
+            [
+                f"{DELIGHT_SUBFOLDER}/**",
+                f"{PAINT_SUBFOLDER}/**",
+                "LICENSE",
+                "NOTICE",
+                "README.md",
+            ],
+            common_ignore
+            + [f"{PAINT_SUBFOLDER}/unet/diffusion_pytorch_model.bin"],
+        )
+    raise EngineError("model-download", "Refusing an unpinned model repository")
+
+
+def _download_snapshot_once(repo_id: str, revision: str, local_dir: Path) -> None:
+    expected = {
+        SHAPE_REPOSITORY: (
+            SHAPE_REVISION,
+            _engine_state_root() / "models" / "Hunyuan3D-2mini",
+        ),
+        PAINT_REPOSITORY: (
+            PAINT_REVISION,
+            _engine_state_root() / "models" / "Hunyuan3D-2",
+        ),
+    }.get(repo_id)
+    if expected is None or revision != expected[0]:
+        raise EngineError("model-download", "Refusing an unpinned model revision")
+    expected_root = expected[1].resolve()
+    if local_dir.resolve() != expected_root:
+        raise EngineError("model-download", "Refusing an unexpected model destination")
+
+    # huggingface_hub reads these settings at import time. A finite socket
+    # timeout plus a single worker avoids indefinite concurrent-download hangs.
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"
+    os.environ["HF_HUB_ETAG_TIMEOUT"] = "30"
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    os.environ["DO_NOT_TRACK"] = "1"
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    os.environ.pop("HF_TOKEN", None)
+    os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+    _activate_engine_paths()
+    from huggingface_hub import snapshot_download
+
+    allow_patterns, ignore_patterns = _download_patterns(repo_id)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        local_dir=str(local_dir),
+        allow_patterns=allow_patterns,
+        ignore_patterns=ignore_patterns,
+        max_workers=1,
+    )
+
+
+def _download_observed_roots(local_dir: Path) -> list[Path]:
+    roots = [local_dir]
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(Path(value).expanduser())
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        roots.append(Path(hf_home).expanduser() / "hub")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = os.path.normcase(os.path.abspath(str(root)))
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def _download_signature(roots: list[Path]) -> tuple[int, int, int]:
+    files = 0
+    total_bytes = 0
+    newest_ns = 0
+    for root in roots:
+        try:
+            candidates = root.rglob("*") if root.exists() else ()
+            for candidate in candidates:
+                try:
+                    if not candidate.is_file():
+                        continue
+                    stat = candidate.stat()
+                    files += 1
+                    total_bytes += stat.st_size
+                    newest_ns = max(newest_ns, stat.st_mtime_ns)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return files, total_bytes, newest_ns
+
+
+def _stop_download_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _run_download_attempt(
     *,
     repo_id: str,
     revision: str,
     local_dir: Path,
-    allow_patterns: list[str],
-    ignore_patterns: list[str],
+    progress_percent: int,
+) -> None:
+    command = [
+        sys.executable,
+        "-I",
+        "-X",
+        "utf8",
+        str(Path(__file__).resolve()),
+        "--download-repository",
+        repo_id,
+        "--download-revision",
+        revision,
+        "--download-dir",
+        str(local_dir),
+    ]
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "HF_HUB_DOWNLOAD_TIMEOUT": "60",
+            "HF_HUB_ETAG_TIMEOUT": "30",
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+            "HF_HUB_DISABLE_TELEMETRY": "1",
+            "DO_NOT_TRACK": "1",
+        }
+    )
+    for name in (
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+    ):
+        environment.pop(name, None)
+
+    process = subprocess.Popen(
+        command,
+        cwd=str(BUNDLE_ROOT),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    roots = _download_observed_roots(local_dir)
+    signature = _download_signature(roots)
+    last_change = time.monotonic()
+    last_status = last_change
+    while process.poll() is None:
+        time.sleep(DOWNLOAD_POLL_SECONDS)
+        now = time.monotonic()
+        current = _download_signature(roots)
+        if current != signature:
+            signature = current
+            last_change = now
+        if now - last_status >= DOWNLOAD_STATUS_SECONDS:
+            cached_gib = current[1] / float(1024**3)
+            _progress(
+                progress_percent,
+                f"Model download active; {cached_gib:.2f} GiB cached locally",
+            )
+            last_status = now
+        if now - last_change >= DOWNLOAD_STALL_SECONDS:
+            _stop_download_process(process)
+            raise TimeoutError(
+                f"No downloaded byte changed for {DOWNLOAD_STALL_SECONDS} seconds"
+            )
+
+    stdout, stderr = process.communicate()
+    if process.returncode != 0:
+        detail = _sanitize(stderr or stdout or f"exit code {process.returncode}")
+        raise RuntimeError(detail)
+
+
+def _download_snapshot_resumable(
+    *,
+    repo_id: str,
+    revision: str,
+    local_dir: Path,
     progress_percent: int,
 ) -> None:
     last_error: Exception | None = None
     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
         try:
-            snapshot_download(
+            _run_download_attempt(
                 repo_id=repo_id,
                 revision=revision,
-                local_dir=str(local_dir),
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-                max_workers=2,
+                local_dir=local_dir,
+                progress_percent=progress_percent,
             )
             return
         except Exception as exc:
@@ -421,9 +626,6 @@ def _download_snapshot_resumable(
 
 
 def _download_models(state_root: Path) -> tuple[Path, Path, bool]:
-    _activate_engine_paths()
-    from huggingface_hub import snapshot_download
-
     models_root = state_root / "models"
     shape_root = models_root / "Hunyuan3D-2mini"
     paint_root = models_root / "Hunyuan3D-2"
@@ -441,23 +643,13 @@ def _download_models(state_root: Path) -> tuple[Path, Path, bool]:
                 "Hunyuan3D needs at least 24 GB of free disk space for its one-time models",
             )
 
-    common_ignore = ["*.ckpt", "*.pt", "*.pth", "*.pkl"]
     if not _snapshot_ready(shape_root, shape_required):
         _progress(13, "Downloading the official Hunyuan3D 2mini model once (resumable)")
         shape_root.mkdir(parents=True, exist_ok=True)
         _download_snapshot_resumable(
-            snapshot_download,
             repo_id=SHAPE_REPOSITORY,
             revision=SHAPE_REVISION,
             local_dir=shape_root,
-            allow_patterns=[
-                f"{SHAPE_SUBFOLDER}/config.yaml",
-                f"{SHAPE_SUBFOLDER}/model.fp16.safetensors",
-                "LICENSE",
-                "NOTICE",
-                "README.md",
-            ],
-            ignore_patterns=common_ignore,
             progress_percent=13,
         )
         downloaded = True
@@ -474,19 +666,9 @@ def _download_models(state_root: Path) -> tuple[Path, Path, bool]:
             except OSError:
                 pass
         _download_snapshot_resumable(
-            snapshot_download,
             repo_id=PAINT_REPOSITORY,
             revision=PAINT_REVISION,
             local_dir=paint_root,
-            allow_patterns=[
-                f"{DELIGHT_SUBFOLDER}/**",
-                f"{PAINT_SUBFOLDER}/**",
-                "LICENSE",
-                "NOTICE",
-                "README.md",
-            ],
-            ignore_patterns=common_ignore
-            + [f"{PAINT_SUBFOLDER}/unet/diffusion_pytorch_model.bin"],
             progress_percent=18,
         )
         downloaded = True
@@ -993,6 +1175,7 @@ def _self_test() -> int:
         "quality_first_shape": SHAPE_LOW_VRAM_PROFILES[0][0] == 384,
         "quality_first_paint": PAINT_LOW_VRAM_RESOLUTIONS[0] == 2048,
         "download_retries": MAX_DOWNLOAD_ATTEMPTS >= 3,
+        "download_stall_watchdog": DOWNLOAD_STALL_SECONDS >= 60,
         "required_paint_weights": set(PINNED_PAINT_WEIGHTS).issubset(
             PAINT_REQUIRED_FILES
         ),
@@ -1011,6 +1194,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job", help="Mujassam schema-v3 job JSON")
     parser.add_argument("--stage", choices=("shape", "paint", "upscale"))
     parser.add_argument("--state", help="Trusted stage state JSON")
+    parser.add_argument(
+        "--download-repository", choices=(SHAPE_REPOSITORY, PAINT_REPOSITORY)
+    )
+    parser.add_argument("--download-revision")
+    parser.add_argument("--download-dir")
     parser.add_argument("--self-test", action="store_true")
     return parser
 
@@ -1020,6 +1208,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return _self_test()
     try:
+        if args.download_repository:
+            if not args.download_revision or not args.download_dir:
+                raise EngineError(
+                    "usage",
+                    "--download-revision and --download-dir are required",
+                )
+            _download_snapshot_once(
+                args.download_repository,
+                args.download_revision,
+                Path(args.download_dir),
+            )
+            return 0
         if args.stage:
             if not args.state:
                 raise EngineError("usage", "--state is required with --stage")
