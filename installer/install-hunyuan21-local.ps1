@@ -150,6 +150,19 @@ function Remove-SafeStagingDirectory([string]$Path, [string]$TemporaryRoot) {
     [IO.Directory]::Delete($PathFull, $true)
 }
 
+function Remove-TemporaryFileBestEffort([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    try {
+        if ([IO.File]::Exists($Path)) {
+            [IO.File]::Delete($Path)
+        }
+    } catch {
+        Write-Warning "تعذر حذف الملف المؤقت $Path`: $($_.Exception.Message)"
+    }
+}
+
 if ($PSVersionTable.PSVersion.Major -lt 7 -or -not $IsWindows -or
     -not [Environment]::Is64BitOperatingSystem -or
     -not [Environment]::Is64BitProcess) {
@@ -517,17 +530,44 @@ try {
                 [IO.File]::Delete($TemporaryDestination)
                 throw "فشل تحقق النسخة المؤقتة قبل الاستبدال: $Relative"
             }
-            $Existed = Test-Path -LiteralPath $Destination -PathType Leaf
+            $Existed = $OriginalByPath.ContainsKey($Relative)
             if ($Existed) {
-                [IO.File]::Replace($TemporaryDestination, $Destination, $null, $true)
-            } else {
-                [IO.File]::Move($TemporaryDestination, $Destination)
+                $OriginalEntry = $OriginalByPath[$Relative]
+                if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or
+                    (Get-Sha256 $Destination) -cne [string]$OriginalEntry.sha256) {
+                    Remove-TemporaryFileBestEffort $TemporaryDestination
+                    throw "تغيّر ملف الهدف قبل التثبيت مباشرة: $Relative"
+                }
+            } elseif (Test-Path -LiteralPath $Destination) {
+                Remove-TemporaryFileBestEffort $TemporaryDestination
+                throw "ظهر مسار هدف جديد قبل التثبيت مباشرة: $Relative"
+            }
+            $ReplacementBackup = $null
+            try {
+                if ($Existed) {
+                    $ReplacementBackup = Join-Path $DestinationParent (
+                        "MujassamAI-replaced-" +
+                        [Guid]::NewGuid().ToString("N") + ".tmp")
+                    [IO.File]::Replace(
+                        $TemporaryDestination, $Destination,
+                        $ReplacementBackup, $true)
+                } else {
+                    [IO.File]::Move($TemporaryDestination, $Destination)
+                }
+            } catch {
+                Remove-TemporaryFileBestEffort $TemporaryDestination
+                Remove-TemporaryFileBestEffort $ReplacementBackup
+                throw
             }
             $Applied.Add([ordered]@{
                 path = $Relative
                 existed = $Existed
                 installed_sha256 = [string]$Entry.sha256
             })
+            Remove-TemporaryFileBestEffort $ReplacementBackup
+            if ((Get-Sha256 $Destination) -cne [string]$Entry.sha256) {
+                throw "فشل تحقق الملف مباشرة بعد التثبيت: $Relative"
+            }
         }
         foreach ($Entry in $ManifestFiles) {
             $Destination = Get-ContainedPath $RootPath ([string]$Entry.path)
@@ -551,11 +591,23 @@ try {
                     if ((Get-Sha256 $BackupFile) -cne [string]$OriginalEntry.sha256) {
                         throw "بصمة النسخة الاحتياطية تغيّرت"
                     }
+                    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+                        $CurrentHash = Get-Sha256 $Destination
+                        if ($CurrentHash -ceq [string]$OriginalEntry.sha256) {
+                            continue
+                        }
+                        if ($CurrentHash -cne [string]$AppliedEntry.installed_sha256) {
+                            throw "تغيّر الملف بعد فشل التثبيت؛ لم تتم الكتابة فوقه"
+                        }
+                    } elseif (Test-Path -LiteralPath $Destination) {
+                        throw "مسار الهدف بعد فشل التثبيت ليس ملفًا"
+                    }
                     $Parent = [IO.Path]::GetDirectoryName($Destination)
                     $RollbackTemporary = Join-Path $Parent (
                         "MujassamAI-rollback-" +
                         [Guid]::NewGuid().ToString("N") + ".tmp")
                     [IO.File]::Copy($BackupFile, $RollbackTemporary, $false)
+                    $RollbackReplacementBackup = $null
                     try {
                         if ((Get-Sha256 $RollbackTemporary) -cne
                             [string]$OriginalEntry.sha256) {
@@ -563,15 +615,18 @@ try {
                         }
                         Assert-NoReparsePointInExistingPath $RootPath $Destination
                         if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+                            $RollbackReplacementBackup = Join-Path $Parent (
+                                "MujassamAI-rollback-replaced-" +
+                                [Guid]::NewGuid().ToString("N") + ".tmp")
                             [IO.File]::Replace(
-                                $RollbackTemporary, $Destination, $null, $true)
+                                $RollbackTemporary, $Destination,
+                                $RollbackReplacementBackup, $true)
                         } else {
                             [IO.File]::Move($RollbackTemporary, $Destination)
                         }
                     } finally {
-                        if (Test-Path -LiteralPath $RollbackTemporary) {
-                            [IO.File]::Delete($RollbackTemporary)
-                        }
+                        Remove-TemporaryFileBestEffort $RollbackTemporary
+                        Remove-TemporaryFileBestEffort $RollbackReplacementBackup
                     }
                     if ((Get-Sha256 $Destination) -cne
                         [string]$OriginalEntry.sha256) {
