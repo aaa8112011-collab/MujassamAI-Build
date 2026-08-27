@@ -24,6 +24,15 @@ source, Mujassam AI changes it only as needed for the following integration:
 * export of albedo and metallic-roughness PBR material data in the final GLB;
 * quality profiles for 512/768 multiview PBR generation and a resumable model
   download flow.
+* replacement of the BasicSR/Real-ESRGAN Python training stack with the
+  repository-owned, inference-only RRDBNet loader for the exact official x4
+  checkpoint;
+* replacement of upstream OmegaConf-only inference configuration reads with
+  a small PyYAML compatibility layer, avoiding source-only build dependencies;
+* an explicit personal_local_only acceptance scope that stores no provider
+  identity and never authorizes distribution or third-party functionality;
+* complete CPython 3.11 win_amd64 runtime/build wheel locks with one exact
+  SHA-256 per packaged dependency.
 
 Every upstream file changed by the build must retain its original notice and
 carry a prominent "Modified by Mujassam AI" header. The complete current

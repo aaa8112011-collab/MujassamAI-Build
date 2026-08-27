@@ -1,4 +1,4 @@
-"""Memory-bounded Real-ESRGAN x2 texture restoration.
+"""Memory-bounded Real-ESRGAN x2/x4 texture restoration.
 
 The network layout matches the official ``RealESRGAN_x2plus`` checkpoint:
 RRDBNet(3, 3, 64, 23, 32, scale=2).  Only the official ``params_ema`` tensor
@@ -56,6 +56,17 @@ REALESRGAN_X2PLUS = ModelSpec(
     byte_count=67_061_725,
     sha256="49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb",
     scale=2,
+)
+
+REALESRGAN_X4PLUS = ModelSpec(
+    file_name="RealESRGAN_x4plus.pth",
+    download_url=(
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/"
+        "v0.1.0/RealESRGAN_x4plus.pth"
+    ),
+    byte_count=67_040_989,
+    sha256="4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+    scale=4,
 )
 
 
@@ -254,6 +265,33 @@ def load_realesrgan_x2plus(
     return RealESRGANx2(model=model, device=resolved, half=use_half, scale=2)
 
 
+def load_realesrgan_x4plus(
+    model_path: str | os.PathLike[str],
+    *,
+    device: str | torch.device | None = None,
+    half: bool = True,
+) -> "RealESRGANx2":
+    """Verify and load the official x4plus model without BasicSR/RealESRGAN."""
+
+    verified = verify_weight_file(model_path, REALESRGAN_X4PLUS)
+    state = _safe_checkpoint_state(verified)
+    model = RRDBNet(3, 3, 64, 23, 32, scale=4)
+    try:
+        incompatible = model.load_state_dict(state, strict=True)
+    except Exception as exc:
+        raise QualityError(f"The verified AI weights do not match RRDBNet x4plus: {exc}") from exc
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise QualityError("The verified x4plus weights did not load strictly.")
+    del state
+    gc.collect()
+    resolved = _resolve_device(device)
+    use_half = bool(half and resolved.type == "cuda")
+    model.eval().requires_grad_(False).to(device=resolved)
+    if use_half:
+        model.half()
+    return RealESRGANx2(model=model, device=resolved, half=use_half, scale=4)
+
+
 def _is_cuda_oom(exc: BaseException) -> bool:
     text = str(exc).lower()
     return any(
@@ -278,7 +316,7 @@ def _source_alpha(image: Image.Image) -> Image.Image | None:
 
 
 class RealESRGANx2:
-    """Run x2 restoration with CPU assembly and automatic CUDA OOM fallback."""
+    """Run x2/x4 restoration with CPU assembly and automatic CUDA OOM fallback."""
 
     def __init__(
         self,
@@ -292,8 +330,8 @@ class RealESRGANx2:
         self.device = _resolve_device(device)
         self.half = bool(half and self.device.type == "cuda")
         self.scale = int(scale)
-        if self.scale != 2:
-            raise ValueError("This runner supports the x2 model only")
+        if self.scale not in (2, 4):
+            raise ValueError("This runner supports only the official x2plus/x4plus scales")
 
     def _automatic_tile_size(self) -> int:
         if self.device.type != "cuda":
@@ -382,7 +420,7 @@ class RealESRGANx2:
         tile_pad: int = 16,
         minimum_tile: int = 64,
     ) -> Image.Image:
-        """Restore and upscale a Pillow RGB/RGBA texture exactly two times.
+        """Restore and upscale a Pillow RGB/RGBA texture by the model scale.
 
         Alpha is never sent through the RGB network.  It is independently
         resized with Lanczos and restored after inference, preventing RGB/alpha
@@ -607,6 +645,12 @@ def self_test() -> dict[str, Any]:
     if shape != (1, 3, 16, 20):
         raise AssertionError(f"RRDBNet x2 shape mismatch: {shape}")
 
+    tiny_x4 = RRDBNet(3, 3, num_feat=8, num_block=1, num_grow_ch=4, scale=4).eval()
+    with torch.inference_mode():
+        x4_shape = tuple(tiny_x4(torch.rand(1, 3, 8, 10)).shape)
+    if x4_shape != (1, 3, 32, 40):
+        raise AssertionError(f"RRDBNet x4 shape mismatch: {x4_shape}")
+
     class _NearestX2(nn.Module):
         def forward(self, value: Tensor) -> Tensor:
             return F.interpolate(value, scale_factor=2, mode="nearest")
@@ -642,6 +686,7 @@ def self_test() -> dict[str, Any]:
     return {
         "ok": True,
         "architecture_output": list(shape),
+        "architecture_x4_output": list(x4_shape),
         "tiled_rgba_output": list(tiled.size),
         "normal_max_unit_error": round(length_error, 6),
         "weight_required": False,
