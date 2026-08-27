@@ -8,6 +8,10 @@ permissions:
   issues: write
   pull-requests: write
 
+concurrency:
+  group: hy21-lock-capture-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   capture-windows-locks:
     runs-on: windows-2022
@@ -42,19 +46,19 @@ jobs:
             $Path = Join-Path $Root $Name
             python -m venv $Path
             $Python = Join-Path $Path "Scripts/python.exe"
-            & $Python -m pip install --disable-pip-version-check --no-cache-dir `
+            & $Python -m pip install --disable-pip-version-check `
                 --only-binary=:all: "pip==24.3.1" | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "Failed to pin pip in $Name" }
             return $Python
           }
 
           $BuildPython = New-LockVenv "build-env"
-          & $BuildPython -m pip install --disable-pip-version-check --no-cache-dir `
+          & $BuildPython -m pip install --disable-pip-version-check `
               --only-binary=:all: `
               "setuptools==69.5.1" "wheel==0.45.1" `
               "ninja==1.11.1.3" "pybind11==2.13.6"
           if ($LASTEXITCODE -ne 0) { throw "Failed to resolve build tools" }
-          & $BuildPython -m pip install --disable-pip-version-check --no-cache-dir `
+          & $BuildPython -m pip install --disable-pip-version-check `
               --only-binary=:all: --extra-index-url $TorchIndex `
               "torch==2.5.1+cu124" "torchvision==0.20.1+cu124"
           if ($LASTEXITCODE -ne 0) { throw "Failed to resolve pinned CUDA PyTorch" }
@@ -70,7 +74,7 @@ jobs:
           python $Helper filter --freeze $BuildFreeze --output $BuildResolved `
               --exclude pip
           if ($LASTEXITCODE -ne 0) { throw "Failed to filter build resolution" }
-          & $BuildPython -m pip download --disable-pip-version-check --no-cache-dir `
+          & $BuildPython -m pip download --disable-pip-version-check `
               --only-binary=:all: --no-deps --dest $BuildWheelhouse.FullName `
               --extra-index-url $TorchIndex -r $BuildResolved
           if ($LASTEXITCODE -ne 0) { throw "Failed to download resolved build wheels" }
@@ -80,11 +84,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to materialize build lock" }
 
           $RuntimePython = New-LockVenv "runtime-env"
-          & $RuntimePython -m pip install --disable-pip-version-check --no-cache-dir `
-              --only-binary=:all: --extra-index-url $TorchIndex `
+          & $RuntimePython -m pip install --disable-pip-version-check `
+              --only-binary=:all: --no-index --find-links $BuildWheelhouse.FullName `
               "torch==2.5.1+cu124" "torchvision==0.20.1+cu124"
           if ($LASTEXITCODE -ne 0) { throw "Failed to seed runtime ABI" }
-          & $RuntimePython -m pip install --disable-pip-version-check --no-cache-dir `
+          & $RuntimePython -m pip install --disable-pip-version-check `
               --only-binary=:all: -r $RuntimeInput 2>&1 | Out-Host
           if ($LASTEXITCODE -ne 0) { throw "Failed to resolve runtime dependencies as wheels" }
           & $RuntimePython -m pip check
@@ -102,7 +106,7 @@ jobs:
               --exclude torchgen --exclude functorch --exclude sympy `
               --exclude ninja --exclude pybind11
           if ($LASTEXITCODE -ne 0) { throw "Failed to filter runtime resolution" }
-          & $RuntimePython -m pip download --disable-pip-version-check --no-cache-dir `
+          & $RuntimePython -m pip download --disable-pip-version-check `
               --only-binary=:all: --no-deps --dest $RuntimeWheelhouse.FullName `
               -r $RuntimeResolved
           if ($LASTEXITCODE -ne 0) { throw "Failed to download resolved runtime wheels" }
@@ -112,16 +116,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Failed to materialize runtime lock" }
 
           $VerifyPython = New-LockVenv "verify-env"
-          & $VerifyPython -m pip install --disable-pip-version-check --no-cache-dir `
-              --only-binary=:all: --require-hashes --extra-index-url $TorchIndex `
+          & $VerifyPython -m pip install --disable-pip-version-check `
+              --only-binary=:all: --no-index --find-links $BuildWheelhouse.FullName `
+              --require-hashes `
               -r $BuildLock
           if ($LASTEXITCODE -ne 0) { throw "Build hash-lock replay failed" }
           & $VerifyPython -m pip check
           if ($LASTEXITCODE -ne 0) { throw "Replayed build lock is inconsistent" }
 
           $RuntimeTarget = Join-Path $Root "runtime-target"
-          & $VerifyPython -m pip install --disable-pip-version-check --no-cache-dir `
-              --only-binary=:all: --no-deps --require-hashes `
+          & $VerifyPython -m pip install --disable-pip-version-check `
+              --only-binary=:all: --no-index --find-links $RuntimeWheelhouse.FullName `
+              --no-deps --require-hashes `
               --target $RuntimeTarget -r $RuntimeLock
           if ($LASTEXITCODE -ne 0) { throw "Runtime hash-lock replay failed" }
           $env:PYTHONPATH = $RuntimeTarget
