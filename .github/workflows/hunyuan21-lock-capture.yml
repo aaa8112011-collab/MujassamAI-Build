@@ -6,6 +6,7 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: write
 
 jobs:
   capture-windows-locks:
@@ -151,7 +152,8 @@ jobs:
           $Transcript = Join-Path $env:RUNNER_TEMP `
               "hy21-lock-capture/capture-transcript.txt"
           $Diagnostic = ""
-          if (Test-Path $Transcript -PathType Leaf) {
+          if ($env:LOCK_OUTCOME -ne "success" -and
+              (Test-Path $Transcript -PathType Leaf)) {
             $Text = Get-Content $Transcript -Raw
             if ($Text.Length -gt 24000) { $Text = $Text.Substring($Text.Length - 24000) }
             $Diagnostic = [Convert]::ToBase64String(
