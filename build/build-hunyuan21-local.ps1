@@ -145,11 +145,12 @@ $VsWhere = Join-Path $ProgramFilesX86 `
 if (-not (Test-Path -LiteralPath $VsWhere -PathType Leaf)) {
     throw "Visual Studio Installer/vswhere غير موجود. ثبّت VS 2022 Build Tools."
 }
+$Msvc142Component = "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64"
 $VsInstall = (& $VsWhere -latest -products * `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+    -requires $Msvc142Component `
     -property installationPath | Select-Object -First 1)
 if ([string]::IsNullOrWhiteSpace($VsInstall)) {
-    throw "مكوّن C++ x64 في Visual Studio 2022 Build Tools غير موجود."
+    throw "مكوّن MSVC v142/14.29 x64 في Visual Studio غير موجود."
 }
 $Msvc142 = @(Get-ChildItem -LiteralPath (Join-Path $VsInstall "VC\Tools\MSVC") `
     -Directory -Filter "14.29.*" -ErrorAction SilentlyContinue | Where-Object {

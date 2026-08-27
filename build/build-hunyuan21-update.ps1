@@ -261,11 +261,12 @@ $env:PATH = "$CudaHome\bin;$env:PATH"
 $ProgramFilesX86 = [Environment]::GetFolderPath(
     [Environment+SpecialFolder]::ProgramFilesX86)
 $VsWhere = Join-Path $ProgramFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+$Msvc142Component = "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64"
 $VsInstall = (& $VsWhere -latest -products * `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+    -requires $Msvc142Component `
     -property installationPath | Select-Object -First 1)
 if (-not $VsInstall) {
-    throw "Visual Studio 2022 C++ tools were not found"
+    throw "Visual Studio with MSVC v142/14.29 x64 was not found"
 }
 Import-Module "$VsInstall\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
 Enter-VsDevShell -VsInstallPath $VsInstall -SkipAutomaticLocation `
