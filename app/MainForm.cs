@@ -20,10 +20,14 @@ namespace MujassamPortable
         private const string ArtifactPrefix = "MJARTIFACT|";
         private const string ErrorPrefix = "MJERROR|";
         private const int MaximumLogCharacters = 240000;
-        internal const int JobSchemaVersion = 2;
+        internal const int JobSchemaVersion = 3;
 
         private const string TargetRoblox = "roblox";
         private const string TargetUnreal = "unreal";
+        private const string EngineHunyuanMini = "hunyuan3d_2mini_low_vram";
+        private const string EngineHunyuanPbr = "hunyuan3d_2_1_pbr";
+        private const string EngineSpar3dLegacy = "spar3d_legacy";
+        private const string HunyuanAcceptanceFileName = "acceptance-v1.txt";
         private const string TextureNative2K = "native_2k";
         private const string TextureAiStudio4K = "ai_4k";
         private const string TextureAiStudio8K = "export_8k";
@@ -37,6 +41,7 @@ namespace MujassamPortable
         private readonly TextBox imagePathBox;
         private readonly TextBox outputPathBox;
         private readonly PictureBox imagePreview;
+        private readonly ComboBox engineBox;
         private readonly ComboBox targetBox;
         private readonly ComboBox textureBox;
         private readonly ComboBox hardwareBox;
@@ -76,6 +81,7 @@ namespace MujassamPortable
             imagePathBox = CreatePathTextBox();
             outputPathBox = CreatePathTextBox();
             imagePreview = new PictureBox();
+            engineBox = CreateDropDown();
             targetBox = CreateDropDown();
             textureBox = CreateDropDown();
             hardwareBox = CreateDropDown();
@@ -167,7 +173,7 @@ namespace MujassamPortable
             };
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 158));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 205));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 65));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 53));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 165));
@@ -283,7 +289,7 @@ namespace MujassamPortable
                 Dock = DockStyle.Fill,
                 Padding = new Padding(13, 10, 13, 9),
                 ColumnCount = 4,
-                RowCount = 3
+                RowCount = 4
             };
             options.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 105));
             options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
@@ -291,22 +297,26 @@ namespace MujassamPortable
             options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
             options.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
             options.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
+            options.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
             options.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            options.Controls.Add(CreateFieldLabel("الهدف"), 0, 0);
-            options.Controls.Add(targetBox, 1, 0);
+            options.Controls.Add(CreateFieldLabel("محرك 3D"), 0, 0);
+            options.Controls.Add(engineBox, 1, 0);
             options.Controls.Add(CreateFieldLabel("قدرة الجهاز"), 2, 0);
             options.Controls.Add(hardwareBox, 3, 0);
-            options.Controls.Add(CreateFieldLabel("دقة الخامة"), 0, 1);
-            options.Controls.Add(textureBox, 1, 1);
+            options.Controls.Add(CreateFieldLabel("الهدف"), 0, 1);
+            options.Controls.Add(targetBox, 1, 1);
             options.Controls.Add(CreateFieldLabel("الهندسة"), 2, 1);
             options.Controls.Add(geometryBox, 3, 1);
+            options.Controls.Add(CreateFieldLabel("دقة الخامة"), 0, 2);
+            options.Controls.Add(textureBox, 1, 2);
+            options.SetColumnSpan(textureBox, 3);
             optionsHint.Dock = DockStyle.Fill;
             optionsHint.ForeColor = Color.FromArgb(91, 101, 116);
             optionsHint.TextAlign = ContentAlignment.MiddleRight;
             optionsHint.AutoEllipsis = true;
             optionsHint.Padding = new Padding(4, 4, 4, 0);
             options.SetColumnSpan(optionsHint, 4);
-            options.Controls.Add(optionsHint, 0, 2);
+            options.Controls.Add(optionsHint, 0, 3);
             optionsCard.Controls.Add(options);
             root.Controls.Add(optionsCard, 0, 2);
 
@@ -377,12 +387,20 @@ namespace MujassamPortable
 
         private void PopulateOptions()
         {
+            bool hunyuanInstalled = IsHunyuanMiniInstalled();
+            engineBox.Items.Add(hunyuanInstalled
+                ? "Hunyuan3D 2mini — متاح لـ 8GB (موصى به)"
+                : "Hunyuan3D 2mini — يحتاج تحديث المحرك");
+            engineBox.Items.Add("Hunyuan3D 2.1 PBR — قريبًا (24GB+ VRAM)");
+            engineBox.Items.Add("SPAR3D — قديم / احتياطي");
+            engineBox.SelectedIndex = hunyuanInstalled ? 0 : 2;
+
             targetBox.Items.Add("Roblox Studio");
             targetBox.Items.Add("Unreal Engine");
             targetBox.SelectedIndex = 0;
 
             hardwareBox.Items.Add("Auto — يكتشف الجهاز تلقائيًا");
-            hardwareBox.Items.Add("8GB VRAM — وضع آمن");
+            hardwareBox.Items.Add("8GB VRAM — Hunyuan 2mini Low-VRAM");
             hardwareBox.Items.Add("16GB+ VRAM — معالجة أثقل و8K");
             hardwareBox.SelectedIndex = 0;
         }
@@ -394,6 +412,7 @@ namespace MujassamPortable
             generateButton.Click += StartGeneration;
             cancelButton.Click += CancelGeneration;
             openResultButton.Click += OpenResult;
+            engineBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
             targetBox.SelectedIndexChanged += delegate { UpdateTargetControls(); };
             textureBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
             hardwareBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
@@ -405,10 +424,13 @@ namespace MujassamPortable
 
         private void SetDefaultOutputFolder()
         {
-            string documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-            if (String.IsNullOrWhiteSpace(documents))
-                documents = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            outputPathBox.Text = Path.Combine(documents, "Mujassam AI", "Exports");
+            string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string downloads = String.IsNullOrWhiteSpace(profile)
+                ? String.Empty
+                : Path.Combine(profile, "Downloads");
+            if (String.IsNullOrWhiteSpace(downloads) || !Directory.Exists(downloads))
+                downloads = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            outputPathBox.Text = Path.Combine(downloads, "MujassamAI-Exports");
         }
 
         private void UpdateTargetControls()
@@ -449,7 +471,7 @@ namespace MujassamPortable
 
         private void UpdateOptionsHint()
         {
-            if (targetBox.SelectedIndex < 0 || textureBox.SelectedIndex < 0 ||
+            if (engineBox.SelectedIndex < 0 || targetBox.SelectedIndex < 0 || textureBox.SelectedIndex < 0 ||
                 hardwareBox.SelectedIndex < 0 || geometryBox.SelectedIndex < 0)
             {
                 optionsHint.Text = String.Empty;
@@ -458,11 +480,19 @@ namespace MujassamPortable
 
             string hardwareHint;
             if (hardwareBox.SelectedIndex == 1)
-                hardwareHint = "8GB يشغّل وضع الذاكرة المنخفضة";
+                hardwareHint = "8GB متاح فعليًا لـ Hunyuan 2mini عبر Low-VRAM";
             else if (hardwareBox.SelectedIndex == 2)
                 hardwareHint = "16GB+ يفتح الوضع الكامل وتصدير 8K على الجهاز الأقوى";
             else
                 hardwareHint = "Auto يفحص VRAM ويختار الوضع المناسب";
+
+            string engineHint;
+            if (engineBox.SelectedIndex == 0)
+                engineHint = "Hunyuan3D 2mini متاح على 8GB؛ يستخدم Low-VRAM وقد يستعين بـRAM ويستغرق وقتًا أطول";
+            else if (engineBox.SelectedIndex == 1)
+                engineHint = "Hunyuan3D 2.1 PBR قريبًا، ويتطلب جهازًا قويًا بذاكرة 24GB+ VRAM";
+            else
+                engineHint = "SPAR3D هو المحرك القديم الاحتياطي";
 
             string textureHint;
             if (textureBox.SelectedIndex == 0)
@@ -480,7 +510,7 @@ namespace MujassamPortable
             else
                 geometryHint = "Roblox Game-ready أخف وجاهز للاستخدام";
 
-            optionsHint.Text = hardwareHint + " • " + textureHint + " • " + geometryHint + ".";
+            optionsHint.Text = engineHint + " • " + hardwareHint + " • " + textureHint + " • " + geometryHint + ".";
         }
 
         private void BrowseImage(object sender, EventArgs e)
@@ -569,6 +599,22 @@ namespace MujassamPortable
                 ShowInputError("اختر مجلد إخراج.");
                 return;
             }
+            if (engineBox.SelectedIndex == 1)
+            {
+                ShowInputError(
+                    "Hunyuan3D 2.1 PBR قريبًا ويتطلب 24GB+ VRAM.\r\n\r\n" +
+                    "اختر Hunyuan3D 2mini؛ فهو متاح الآن على بطاقة 8GB بوضع Low-VRAM.");
+                return;
+            }
+            if (engineBox.SelectedIndex == 0 && !IsHunyuanMiniInstalled())
+            {
+                ShowInputError(
+                    "مكوّن Hunyuan3D غير موجود داخل مجلد البرنامج.\r\n\r\n" +
+                    "نزّل تحديث Hunyuan3D واستخرج محتوياته فوق مجلد MujassamAI-Portable ثم افتح البرنامج مجددًا.");
+                return;
+            }
+            if (!EnsureHunyuanLicenseAccepted())
+                return;
 
             string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
             string pythonPath = Path.Combine(baseDirectory, "rt", "python.exe");
@@ -602,6 +648,7 @@ namespace MujassamPortable
             Dictionary<string, object> job = CreateJobPayload(
                 imagePath,
                 outputDirectory,
+                engineBox.SelectedIndex,
                 targetBox.SelectedIndex,
                 textureBox.SelectedIndex,
                 hardwareBox.SelectedIndex,
@@ -624,11 +671,20 @@ namespace MujassamPortable
         internal static Dictionary<string, object> CreateJobPayload(
             string imagePath,
             string outputDirectory,
+            int engineIndex,
             int targetIndex,
             int textureIndex,
             int hardwareIndex,
             int geometryIndex)
         {
+            string engineMode;
+            if (engineIndex == 1)
+                engineMode = EngineHunyuanPbr;
+            else if (engineIndex == 2)
+                engineMode = EngineSpar3dLegacy;
+            else
+                engineMode = EngineHunyuanMini;
+
             string target = targetIndex == 0 ? TargetRoblox : TargetUnreal;
             string textureMode;
             if (textureIndex == 0)
@@ -658,6 +714,7 @@ namespace MujassamPortable
             job["schema_version"] = JobSchemaVersion;
             job["image_path"] = imagePath;
             job["output_dir"] = outputDirectory;
+            job["engine_mode"] = engineMode;
             job["target"] = target;
             job["texture_mode"] = textureMode;
             job["hardware_preset"] = hardwarePreset;
@@ -668,8 +725,9 @@ namespace MujassamPortable
         internal static string ValidateConfigurationSchema()
         {
             Dictionary<string, object> roblox = CreateJobPayload(
-                "input.png", "output", 0, 1, 0, 1);
+                "input.png", "output", 0, 0, 1, 0, 1);
             if (!Object.Equals(roblox["schema_version"], JobSchemaVersion) ||
+                !Object.Equals(roblox["engine_mode"], EngineHunyuanMini) ||
                 !Object.Equals(roblox["target"], TargetRoblox) ||
                 !Object.Equals(roblox["texture_mode"], TextureAiStudio4K) ||
                 !Object.Equals(roblox["hardware_preset"], HardwareAuto) ||
@@ -677,17 +735,108 @@ namespace MujassamPortable
                 return "Roblox schema mapping failed.";
 
             Dictionary<string, object> unreal = CreateJobPayload(
-                "input.png", "output", 1, 2, 2, 0);
+                "input.png", "output", 1, 1, 2, 2, 0);
             if (!Object.Equals(unreal["schema_version"], JobSchemaVersion) ||
+                !Object.Equals(unreal["engine_mode"], EngineHunyuanPbr) ||
                 !Object.Equals(unreal["target"], TargetUnreal) ||
                 !Object.Equals(unreal["texture_mode"], TextureAiStudio8K) ||
                 !Object.Equals(unreal["hardware_preset"], Hardware16GbPlus) ||
                 !Object.Equals(unreal["geometry_mode"], GeometryUnrealOriginal))
                 return "Unreal schema mapping failed.";
 
-            if (roblox.Count != 7 || unreal.Count != 7)
+            Dictionary<string, object> legacy = CreateJobPayload(
+                "input.png", "output", 2, 0, 0, 1, 0);
+            if (!Object.Equals(legacy["engine_mode"], EngineSpar3dLegacy))
+                return "SPAR3D schema mapping failed.";
+
+            if (!RequiresHunyuanAcceptance(0) || !RequiresHunyuanAcceptance(1) ||
+                RequiresHunyuanAcceptance(2))
+                return "Hunyuan license acceptance mapping failed.";
+            string acceptancePath = GetHunyuanAcceptancePath();
+            if (!Path.IsPathRooted(acceptancePath) ||
+                !String.Equals(Path.GetFileName(acceptancePath), HunyuanAcceptanceFileName,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(Path.GetFileName(Path.GetDirectoryName(acceptancePath)), "Licenses",
+                    StringComparison.OrdinalIgnoreCase))
+                return "Hunyuan license acceptance path failed.";
+
+            if (roblox.Count != 8 || unreal.Count != 8 || legacy.Count != 8)
                 return "Unexpected job schema field count.";
             return String.Empty;
+        }
+
+        private static bool RequiresHunyuanAcceptance(int engineIndex)
+        {
+            return engineIndex == 0 || engineIndex == 1;
+        }
+
+        private static bool IsHunyuanMiniInstalled()
+        {
+            string root = AppDomain.CurrentDomain.BaseDirectory;
+            return File.Exists(Path.Combine(root, "app", "engines", "hunyuan2", "hunyuan2_worker.py")) &&
+                File.Exists(Path.Combine(root, "app", "engines", "hunyuan2", "ENGINE-MANIFEST.json"));
+        }
+
+        internal static string GetHunyuanAcceptancePath()
+        {
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (String.IsNullOrWhiteSpace(localAppData))
+                localAppData = Path.GetTempPath();
+            return Path.Combine(localAppData, "MujassamAI", "Licenses", HunyuanAcceptanceFileName);
+        }
+
+        private bool EnsureHunyuanLicenseAccepted()
+        {
+            if (!RequiresHunyuanAcceptance(engineBox.SelectedIndex))
+                return true;
+
+            string acceptancePath = GetHunyuanAcceptancePath();
+            if (File.Exists(acceptancePath))
+                return true;
+
+            string message =
+                "قبل تشغيل Hunyuan3D، يلزم تأكيد ما يلي:\r\n\r\n" +
+                "• أؤكد أن الاستخدام يتم داخل منطقة يسمح بها الترخيص. " +
+                "الترخيص يستثني الاتحاد الأوروبي (EU) والمملكة المتحدة (UK) وكوريا الجنوبية.\r\n\r\n" +
+                "• أوافق على Tencent Hunyuan 3D 2.0 Community License Agreement.\r\n\r\n" +
+                "اختر نعم للموافقة والمتابعة، أو لا للإلغاء.";
+            DialogResult answer = MessageBox.Show(
+                this,
+                message,
+                "ترخيص Hunyuan3D",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button2);
+            if (answer != DialogResult.Yes)
+                return false;
+
+            try
+            {
+                string directory = Path.GetDirectoryName(acceptancePath);
+                Directory.CreateDirectory(directory);
+                string temporaryPath = acceptancePath + ".new";
+                string record =
+                    "MujassamAI Hunyuan acceptance v1\r\n" +
+                    "license=Tencent Hunyuan 3D 2.0 Community License Agreement\r\n" +
+                    "territory_confirmation=outside EU, UK, and South Korea\r\n" +
+                    "accepted_utc=" + DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) + "\r\n";
+                File.WriteAllText(temporaryPath, record, new UTF8Encoding(false));
+                if (File.Exists(acceptancePath))
+                    File.Delete(temporaryPath);
+                else
+                    File.Move(temporaryPath, acceptancePath);
+                return File.Exists(acceptancePath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    this,
+                    "تعذر حفظ موافقة الترخيص، لذلك لن يبدأ Hunyuan3D.\r\n\r\n" + ex.Message,
+                    "ترخيص Hunyuan3D",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return false;
+            }
         }
 
         private void BeginWorker(string pythonPath, string workerPath, string jobPath, string outputDirectory)
@@ -698,13 +847,19 @@ namespace MujassamPortable
             activeJobPath = jobPath;
             activeOutputDirectory = outputDirectory;
             progressBar.Value = 0;
-            statusLabel.Text = "جارٍ تشغيل المحرك...";
+            if (engineBox.SelectedIndex == 0)
+                statusLabel.Text = "جارٍ تشغيل Hunyuan3D 2mini على وضع 8GB Low-VRAM...";
+            else if (engineBox.SelectedIndex == 1)
+                statusLabel.Text = "Hunyuan3D 2.1 PBR قريبًا (24GB+ VRAM)";
+            else
+                statusLabel.Text = "جارٍ تشغيل SPAR3D الاحتياطي...";
             logBox.Clear();
             AppendLog("الصورة: " + imagePathBox.Text);
             AppendLog("الإخراج: " + outputDirectory);
+            AppendLog("المحرك: " + engineBox.Text);
             AppendLog("الهدف: " + targetBox.Text);
             AppendLog("الإعدادات: " + hardwareBox.Text + " | " + textureBox.Text + " | " + geometryBox.Text);
-            AppendLog("بدء محرك 3D المحلي...");
+            AppendLog("بدء محرك 3D المحلي المحدد...");
 
             ProcessStartInfo start = new ProcessStartInfo();
             start.FileName = pythonPath;
@@ -1017,6 +1172,7 @@ namespace MujassamPortable
             outputPathBox.Enabled = !running;
             browseImageButton.Enabled = !running;
             browseOutputButton.Enabled = !running;
+            engineBox.Enabled = !running;
             targetBox.Enabled = !running;
             textureBox.Enabled = !running;
             hardwareBox.Enabled = !running;

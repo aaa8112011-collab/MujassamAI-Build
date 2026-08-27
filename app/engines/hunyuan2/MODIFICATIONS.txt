@@ -1,0 +1,19 @@
+Mujassam AI integration notice
+
+This package incorporates a pinned copy of the inference source from
+Tencent-Hunyuan/Hunyuan3D-2 commit
+f8db63096c8282cb27354314d896feba5ba6ff8a.
+
+The packaged Hunyuan Paint UNet loader is modified to load Tencent's official
+FP16 safetensors checkpoint with Accelerate meta-device initialization and
+strict key/shape validation. This avoids the original temporary FP32 copies on
+low-RAM Windows systems. The mesh_processor extension is installed inside its
+declared Python package so the upstream relative import works on Windows.
+
+The Mujassam AI adapter, Windows packaging, staged low-VRAM orchestration,
+model-download verification, and user interface are separate modifications
+created for Mujassam AI. The model weights are not redistributed in the update;
+the application downloads the selected, pinned files from Tencent's official
+Hugging Face repositories after the user accepts the applicable license.
+
+Mujassam AI is not affiliated with or endorsed by Tencent.

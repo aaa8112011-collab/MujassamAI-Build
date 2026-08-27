@@ -1,0 +1,22 @@
+# Runtime-only Python dependencies for the bundled Hunyuan3D-2 adapter.
+# torch/torchvision are deliberately absent: the portable base already pins
+# torch 2.5.1+cu124 and torchvision 0.20.1+cu124.
+accelerate==1.2.1
+diffusers==0.31.0
+einops==0.8.0
+huggingface-hub==0.27.0
+numpy==1.26.4
+omegaconf==2.3.0
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+pymeshlab==2023.12.post2
+pygltflib==1.16.2
+pybind11==2.13.6
+PyYAML==6.0.2
+safetensors==0.4.5
+scipy==1.14.1
+tokenizers==0.20.3
+tqdm==4.67.1
+transformers==4.46.3
+trimesh==4.4.9
+xatlas==0.0.9

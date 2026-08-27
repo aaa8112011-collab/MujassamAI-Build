@@ -9,6 +9,8 @@
 
 - `MujassamAI.exe` — الواجهة العربية.
 - Python 3.11 application-local ومعزول داخل الحزمة.
+- Hunyuan3D 2mini + Hunyuan3D Paint داخل نفس الواجهة، مع وضع Low‑VRAM
+  متعدد المراحل لبطاقات 8GB.
 - SPAR3D بوضع تلقائي يتكيّف مع بطاقات 8GB أو الأجهزة الأقوى.
 - Real-ESRGAN x2plus الرسمي لترميم خامة اللون فعليًا بدقة 4K/8K.
 - أوزان النموذج وأداة إزالة الخلفية للعمل محليًا بعد انتهاء التثبيت.
@@ -33,6 +35,21 @@ Python أو CUDA Toolkit أو Visual Studio. يلزم فقط Windows 10/11 ‏64
 
 لا تضع المفتاح في ملف، ولا تلصقه في Workflow input أو سجل عام.
 
+## تثبيت محرك Hunyuan3D على النسخة الموجودة
+
+هذا تحديث يدوي للبرنامج نفسه، وليس EXE ثانيًا ولا يحتاج `HF_TOKEN`:
+
+1. افتح **Actions → Build Hunyuan3D 8GB engine update → Run workflow**.
+2. بعد ظهور العلامة الخضراء نزّل Artifact باسم
+   `MujassamAI-Hunyuan-Update-v1`.
+3. أغلق `MujassamAI.exe`، ثم استخرج محتويات التحديث مباشرة فوق مجلد
+   `Documents\MujassamAI-Portable` ووافق على الاستبدال.
+4. افتح `MujassamAI.exe` نفسه واختر **Hunyuan3D 2mini — 8GB Low‑VRAM**.
+
+أول إنشاء فقط ينزّل أوزان Hunyuan الرسمية إلى `LocalAppData` بتنزيل قابل
+للاستكمال. بعدها يبقى التوليد محليًا. اترك 24GB مساحة فارغة، ولا تحذف مجلد
+النماذج بين مرات التشغيل.
+
 ## الاستخدام
 
 1. شغّل `Setup.exe` من GitHub Release وانتظر اكتمال التنزيل والتحقق.
@@ -53,6 +70,13 @@ Python أو CUDA Toolkit أو Visual Studio. يلزم فقط Windows 10/11 ‏64
 يُشغّل GAN على Normal أو Roughness/Metallic، ويعيد تطبيع متجهات Normal بعد
 تغيير الحجم. الناتج دائمًا ملف واحد باسم `model.glb` مطابق للاختيار الظاهر.
 
+المحرك الافتراضي هو **Hunyuan3D 2mini — 8GB Low‑VRAM**. يصنع الهندسة أولًا،
+يغلق عملية CUDA بالكامل، ثم يشغّل Hunyuan3D Paint لتوليد مشاهد متعددة وخامة
+تغطي الجوانب قبل ترميم الدقة. يبدأ بمحاولة هندسة 384 وخامة أصلية 2048، وينزل
+تلقائيًا إلى إعداد أصغر فقط عند نفاد VRAM. أول تشغيل ينزّل النماذج الرسمية
+المثبتة على إصدارات محددة إلى LocalAppData؛ اترك 24GB فارغة واتصال الإنترنت
+مفتوحًا. لا تُخزن أوزان Hunyuan داخل GitHub أو ملف التحديث.
+
 خيارات الجهاز هي **Auto** و**8GB** و**16GB+**. يكتشف Auto مقدار VRAM ويستخدم
 وضع الذاكرة المنخفضة وتقسيمات AI صغيرة على 8GB، أو الوضع الكامل وتقسيمات أكبر
 على الجهاز الأقوى. لا يوجد EXE منفصل لكل جهاز.
@@ -66,6 +90,8 @@ RTX 20/30/40 أقوى وتشغيل الإعداد المناسب له.
 ## حدود واضحة
 
 - الناتج Static Mesh، وليس Rig أو Animation.
+- Hunyuan3D 2mini Low‑VRAM هو المسار الموصى به للـRTX 4060 Ti ‏8GB؛ قد
+  يستعين بذاكرة RAM/pagefile ويستغرق وقتًا أطول، لكنه ليس مقفولًا على جهاز 24GB.
 - AI 4K يرمم الحواف والأنسجة أفضل من تكبير Lanczos القديم، لكنه لا يستطيع
   معرفة الجوانب المخفية يقينًا من صورة واحدة.
 - Roblox Game-ready يصنع نسخة تقارب 9,500 رأس. Roblox Master يحتفظ بهندسة
@@ -76,6 +102,12 @@ RTX 20/30/40 أقوى وتشغيل الإعداد المناسب له.
 
 ## المصدر والترخيص
 
-المحرك مبني على [SPAR3D الرسمي](https://github.com/Stability-AI/stable-point-aware-3d) وموزع وفق Stability AI Community License. يجب إبقاء ملفات الترخيص والإشعارات داخل الحزمة.
+المحرك الافتراضي مبني على
+[Tencent Hunyuan3D-2 الرسمي](https://github.com/Tencent-Hunyuan/Hunyuan3D-2)
+والمحرك الاحتياطي مبني على
+[SPAR3D الرسمي](https://github.com/Stability-AI/stable-point-aware-3d).
+يجب إبقاء ملفات الترخيص والإشعارات داخل الحزمة. ترخيص Tencent لا ينطبق في
+الاتحاد الأوروبي أو المملكة المتحدة أو كوريا الجنوبية؛ يعرض البرنامج الموافقة
+قبل أول تشغيل لـHunyuan3D.
 
-**3D Powered by Stability AI.** هذا المشروع غير تابع لـStability AI أو Roblox أو Epic Games أو Hugging Face.
+هذا المشروع غير تابع لـTencent أو Stability AI أو Roblox أو Epic Games أو Hugging Face.

@@ -1,0 +1,59 @@
+name: Build Hunyuan3D 8GB engine update
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mujassam-hunyuan3d-8gb-v1
+  cancel-in-progress: false
+
+jobs:
+  build-hunyuan-update:
+    name: Windows 2022 Hunyuan3D 2mini Low-VRAM
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      ARCHIVE_NAME: MujassamAI-Hunyuan-Update-v1.zip
+
+    steps:
+      - name: Checkout Mujassam AI source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Select CPython 3.11.9
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11.9"
+          architecture: x64
+
+      - name: Build and verify Hunyuan3D Windows update
+        shell: pwsh
+        run: ./build/build-hunyuan2-update.ps1
+
+      - name: Upload the root-layout update
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: MujassamAI-Hunyuan-Update-v1
+          path: ${{ env.MUJASSAM_HUNYUAN_STAGE }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+      - name: Publish build summary
+        shell: pwsh
+        run: |
+          @"
+          ## Mujassam AI — Hunyuan3D 2mini Low-VRAM
+
+          - Windows update compiled and verified.
+          - GUI schema v3 self-test passed.
+          - Official Hunyuan3D source is pinned and its CUDA extensions imported successfully.
+          - No model weights or second PyTorch copy are inside the update.
+          - Verified local ZIP SHA-256: $env:MUJASSAM_HUNYUAN_SHA256
+
+          Download the MujassamAI-Hunyuan-Update-v1 artifact and extract its contents
+          directly over the existing MujassamAI-Portable folder while the app is closed.
+          The official models download once on the first Hunyuan run.
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

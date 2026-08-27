@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "engine": "Hunyuan3D-2mini + Hunyuan3D-Paint-2.0",
+  "source": {
+    "repository": "https://github.com/Tencent-Hunyuan/Hunyuan3D-2",
+    "commit": "f8db63096c8282cb27354314d896feba5ba6ff8a"
+  },
+  "models": {
+    "shape": {
+      "repository": "tencent/Hunyuan3D-2mini",
+      "revision": "f90a0f7df7d5e6f71109cf333f6a95a0ae3194a6",
+      "subfolder": "hunyuan3d-dit-v2-mini",
+      "variant": "fp16"
+    },
+    "delight_and_paint": {
+      "repository": "tencent/Hunyuan3D-2",
+      "revision": "9cd649ba6913f7a852e3286bad86bfa9a2d83dcf",
+      "subfolders": [
+        "hunyuan3d-delight-v2-0",
+        "hunyuan3d-paint-v2-0-turbo"
+      ]
+    }
+  },
+  "runtime_abi": {
+    "python": "3.11",
+    "pytorch": "2.5.1+cu124",
+    "cuda": "12.4",
+    "platform": "win_amd64"
+  },
+  "default_profile": {
+    "name": "rtx-8gb-low-vram",
+    "separate_cuda_processes": true,
+    "shape_octree_first_try": 384,
+    "paint_texture_first_try": 2048,
+    "cpu_offload": true
+  }
+}

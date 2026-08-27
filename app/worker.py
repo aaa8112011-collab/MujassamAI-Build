@@ -19,7 +19,9 @@ import random
 import re
 import shutil
 import struct
+import subprocess
 import sys
+import threading
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -28,14 +30,24 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
-SUPPORTED_SCHEMA_VERSIONS = {1, 2}
+SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3}
 FOREGROUND_RATIO = 1.3
 MAX_JOB_BYTES = 256 * 1024
 MAX_IMAGE_BYTES = 200 * 1024 * 1024
 MAX_IMAGE_PIXELS = 100_000_000
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 TARGETS = {"roblox", "unreal"}
+ENGINE_MODES = {
+    "hunyuan3d_2mini_low_vram",
+    "hunyuan3d_2_1_pbr",
+    "spar3d_legacy",
+}
+ENGINE_DISPLAY_NAMES = {
+    "hunyuan3d_2mini_low_vram": "Hunyuan3D 2mini Low-VRAM",
+    "hunyuan3d_2_1_pbr": "Hunyuan3D 2.1 PBR",
+    "spar3d_legacy": "SPAR3D",
+}
 TEXTURE_MODES = {
     "native_1k": 1024,  # legacy launcher compatibility only
     "native_2k": 2048,
@@ -56,6 +68,7 @@ AI_TEXTURE_MODEL = BUNDLE_ROOT / "models" / "realesrgan" / "RealESRGAN_x2plus.pt
 BACKGROUND_CHECKPOINT = (
     BUNDLE_ROOT / "models" / "transparent-background" / "ckpt_base.pth"
 )
+HUNYUAN2_WORKER = APP_ROOT / "engines" / "hunyuan2" / "hunyuan2_worker.py"
 
 MODEL_CONFIG_NAME = "config.yaml"
 MODEL_WEIGHT_NAME = "model.safetensors"
@@ -102,6 +115,7 @@ class WorkerError(RuntimeError):
 class Job:
     image_path: Path
     output_dir: Path
+    engine_mode: str
     target: str
     texture_mode: str
     geometry_mode: str
@@ -297,8 +311,15 @@ def _parse_job(payload: dict[str, Any]) -> Job:
     common = {"schema_version", "image_path", "output_dir", "target"}
     if schema_version == 1:
         required = common | {"texture_resolution", "roblox_quality"}
-    else:
+    elif schema_version == 2:
         required = common | {"texture_mode", "geometry_mode", "hardware_preset"}
+    else:
+        required = common | {
+            "engine_mode",
+            "texture_mode",
+            "geometry_mode",
+            "hardware_preset",
+        }
     missing = sorted(required - payload.keys())
     unknown = sorted(payload.keys() - required)
     if missing:
@@ -326,10 +347,16 @@ def _parse_job(payload: dict[str, Any]) -> Job:
         if target == "unreal":
             geometry_mode = "original"
         hardware_preset = "auto"
+        engine_mode = "spar3d_legacy"
     else:
         texture_mode = _require_string(payload, "texture_mode")
         geometry_mode = _require_string(payload, "geometry_mode")
         hardware_preset = _require_string(payload, "hardware_preset")
+        engine_mode = (
+            "spar3d_legacy"
+            if schema_version == 2
+            else _require_string(payload, "engine_mode")
+        )
         if texture_mode not in {"native_2k", "ai_4k", "export_8k"}:
             raise WorkerError(
                 "request-schema",
@@ -345,6 +372,12 @@ def _parse_job(payload: dict[str, Any]) -> Job:
                 "request-schema",
                 "hardware_preset must be auto, vram_8gb, or vram_16gb_plus",
             )
+        if engine_mode not in ENGINE_MODES:
+            raise WorkerError(
+                "request-schema",
+                "engine_mode must be hunyuan3d_2mini_low_vram, "
+                "hunyuan3d_2_1_pbr, or spar3d_legacy",
+            )
 
     if texture_mode == "export_8k" and target != "unreal":
         raise WorkerError("request-schema", "8K export is available only for Unreal")
@@ -358,6 +391,7 @@ def _parse_job(payload: dict[str, Any]) -> Job:
     return Job(
         image_path=_validate_image_path(_require_string(payload, "image_path")),
         output_dir=_validate_output_root(_require_string(payload, "output_dir")),
+        engine_mode=engine_mode,
         target=target,
         texture_mode=texture_mode,
         geometry_mode=geometry_mode,
@@ -1103,6 +1137,12 @@ def _apply_selected_texture_profile(
 
 def _run_job(job: Job) -> Path:
     _emit_progress(3, "Validating the portable runtime")
+    if job.engine_mode != "spar3d_legacy":
+        raise WorkerError(
+            "engine-component-missing",
+            f"{ENGINE_DISPLAY_NAMES[job.engine_mode]} was selected, but its local "
+            "runtime component is not installed in this build",
+        )
     bundle = _validate_bundle()
     hub_cache = _configure_runtime_environment(bundle)
     staging, final_dir = _create_output_paths(job)
@@ -1262,6 +1302,7 @@ def _run_job(job: Job) -> Path:
             "request": {
                 "target": job.target,
                 "source_schema_version": job.source_schema_version,
+                "engine_mode": job.engine_mode,
                 "texture_mode": job.texture_mode,
                 "geometry_mode": job.geometry_mode,
                 "hardware_preset": job.hardware_preset,
@@ -1273,6 +1314,8 @@ def _run_job(job: Job) -> Path:
             },
             "reconstruction": {
                 "engine": "SPAR3D",
+                "engine_mode": job.engine_mode,
+                "requested_engine": ENGINE_DISPLAY_NAMES[job.engine_mode],
                 "offline": dinov2_source != "downloaded",
                 "dinov2_downloaded_this_run": dinov2_source == "downloaded",
                 "dinov2_source": dinov2_source,
@@ -1333,23 +1376,106 @@ def _run_job(job: Job) -> Path:
             _safe_remove_staging(staging, job.output_dir)
 
 
+def _run_hunyuan2_component(request_path: Path) -> int:
+    """Run Hunyuan in its own process and relay the existing MJ protocol."""
+
+    try:
+        component = HUNYUAN2_WORKER.resolve(strict=True)
+    except OSError as exc:
+        raise WorkerError(
+            "engine-component-missing",
+            "Hunyuan3D is selected, but its engine update is not installed",
+        ) from exc
+    if not component.is_file() or not _is_within(component, APP_ROOT):
+        raise WorkerError(
+            "engine-component-invalid",
+            "The Hunyuan3D engine component path is invalid",
+        )
+
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:128",
+            "CUDA_MODULE_LOADING": "LAZY",
+        }
+    )
+    command = [
+        sys.executable,
+        "-I",
+        "-X",
+        "utf8",
+        str(component),
+        "--job",
+        str(request_path.resolve(strict=True)),
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=str(BUNDLE_ROOT),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert process.stdout is not None and process.stderr is not None
+
+    def relay(stream: Any, *, error_stream: bool) -> None:
+        for line in iter(stream.readline, ""):
+            raw = line.rstrip("\r\n")
+            if not error_stream and raw.startswith(
+                ("MJPROGRESS|", "MJARTIFACT|", "MJERROR|", "MJSTAGEOOM|")
+            ):
+                cleaned = raw[:2000]
+            else:
+                cleaned = _sanitize(raw, 2000)
+            print(cleaned, file=sys.stderr if error_stream else sys.stdout, flush=True)
+
+    stdout_thread = threading.Thread(
+        target=relay, args=(process.stdout,), kwargs={"error_stream": False}, daemon=True
+    )
+    stderr_thread = threading.Thread(
+        target=relay, args=(process.stderr,), kwargs={"error_stream": True}, daemon=True
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    exit_code = int(process.wait())
+    stdout_thread.join(timeout=5)
+    stderr_thread.join(timeout=5)
+    return exit_code
+
+
 def _self_test() -> int:
     sample_job = Job(
         image_path=Path("input.png"),
         output_dir=Path("output"),
+        engine_mode="hunyuan3d_2mini_low_vram",
         target="roblox",
         texture_mode="ai_4k",
         geometry_mode="target_ready",
         hardware_preset="auto",
-        source_schema_version=2,
+        source_schema_version=3,
     )
     low_profile = _resolve_hardware_profile(sample_job, 8 * 1024**3)
     high_profile = _resolve_hardware_profile(sample_job, 16 * 1024**3)
     checks: list[tuple[bool, str]] = [
-        (SCHEMA_VERSION == 2, "schema version"),
-        (SUPPORTED_SCHEMA_VERSIONS == {1, 2}, "supported schema versions"),
+        (SCHEMA_VERSION == 3, "schema version"),
+        (SUPPORTED_SCHEMA_VERSIONS == {1, 2, 3}, "supported schema versions"),
         (FOREGROUND_RATIO == 1.3, "foreground ratio"),
         (TARGETS == {"roblox", "unreal"}, "targets"),
+        (
+            ENGINE_MODES
+            == {
+                "hunyuan3d_2mini_low_vram",
+                "hunyuan3d_2_1_pbr",
+                "spar3d_legacy",
+            },
+            "engine modes",
+        ),
         (
             TEXTURE_MODES
             == {
@@ -1397,7 +1523,7 @@ def _self_test() -> int:
     if failed:
         _emit_error("self-test", f"Failed checks: {', '.join(failed)}")
         return 1
-    print("MJSELFTEST|OK|2", flush=True)
+    print("MJSELFTEST|OK|3", flush=True)
     return 0
 
 
@@ -1442,6 +1568,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = _load_request(Path(request_value))
         job = _parse_job(payload)
+        if job.engine_mode == "hunyuan3d_2mini_low_vram":
+            return _run_hunyuan2_component(Path(request_value))
         _run_job(job)
         return 0
     except WorkerError as exc:
