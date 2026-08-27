@@ -85,7 +85,7 @@ jobs:
               "torch==2.5.1+cu124" "torchvision==0.20.1+cu124"
           if ($LASTEXITCODE -ne 0) { throw "Failed to seed runtime ABI" }
           & $RuntimePython -m pip install --disable-pip-version-check --no-cache-dir `
-              --only-binary=:all: -r $RuntimeInput
+              --only-binary=:all: -r $RuntimeInput 2>&1 | Out-Host
           if ($LASTEXITCODE -ne 0) { throw "Failed to resolve runtime dependencies as wheels" }
           & $RuntimePython -m pip check
           if ($LASTEXITCODE -ne 0) { throw "Runtime environment dependency check failed" }
