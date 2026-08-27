@@ -243,6 +243,21 @@ def _config_node(value):
         "forbid model-loader network fallback",
     )
 
+    paint_package = root / "hy3dpaint" / "hunyuanpaintpbr" / "__init__.py"
+    replace_once(
+        paint_package,
+        "from .unet.model import HunyuanPaint\n",
+        "# Modified by Mujassam AI: the portable inference runtime omits the "
+        "training-only PyTorch Lightning wrapper.\n",
+        "remove the unused PyTorch Lightning training wrapper",
+    )
+    replace_once(
+        paint_package,
+        "    'HunyuanPaint',\n",
+        "",
+        "remove the unused training wrapper export",
+    )
+
     simplify = root / "hy3dpaint" / "utils" / "simplify_mesh_utils.py"
     replace_once(
         simplify,
