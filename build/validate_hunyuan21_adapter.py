@@ -17,6 +17,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "hunyuan21-pbr-release.yml"
 BUILD_SCRIPT = ROOT / "build" / "build-hunyuan21-update.ps1"
 LOCAL_BUILD_SCRIPT = ROOT / "build" / "build-hunyuan21-local.ps1"
 LOCAL_BUILD_LAUNCHER = ROOT / "build" / "Build-Hunyuan21-Local.cmd"
+LOCAL_BUILD_RECOVERY = ROOT / "build" / "resume-hunyuan21-local.ps1"
 LOCAL_INSTALLER = ROOT / "installer" / "install-hunyuan21-local.ps1"
 LOCAL_RESTORE = ROOT / "installer" / "restore-hunyuan21-local.ps1"
 LOCAL_GUIDE = ROOT / "docs" / "HUNYUAN21-LOCAL-UAE.md"
@@ -444,6 +445,12 @@ def main() -> int:
         and '"pytorch_lightning" not in sys.modules' in build_script,
         "Full-build smoke test must cover the inference-only Paint package exports",
     )
+    require(
+        "$TextFile = $_" in build_script
+        and "$Text = [IO.File]::ReadAllText($TextFile.FullName)" in build_script
+        and "(Get-Content $_.FullName -Raw)" not in build_script,
+        "Staged marker scan must treat valid empty text files as empty strings",
+    )
     vendor_patch = (ROOT / "build" / "patch_hunyuan21_windows.py").read_text(
         encoding="utf-8"
     )
@@ -467,6 +474,7 @@ def main() -> int:
     )
 
     local_build = LOCAL_BUILD_SCRIPT.read_text(encoding="utf-8")
+    local_recovery = LOCAL_BUILD_RECOVERY.read_text(encoding="utf-8")
     local_installer = LOCAL_INSTALLER.read_text(encoding="utf-8")
     local_restore = LOCAL_RESTORE.read_text(encoding="utf-8")
     require(
@@ -480,6 +488,32 @@ def main() -> int:
         and "Remove-Item Env:MUJASSAM_PROVIDER_LEGAL_NAME" in local_build
         and "build-hunyuan21-update.ps1" in local_build,
         "Local UAE builder does not preserve explicit acceptance and hash-lock gates",
+    )
+    require(
+        '[string]$FailedBuildRoot' in local_recovery
+        and "c8c99ed6683d31600edeeb47f883986e77797120" in local_recovery
+        and SOURCE_COMMIT in local_recovery
+        and "^MujassamAI-hy21-[0-9a-f]{32}$" in local_recovery
+        and "[IO.Path]::GetDirectoryName($BuildTemporaryRoot)" in local_recovery
+        and "[IO.FileAttributes]::ReparsePoint" in local_recovery
+        and "$FailedRepositoryCommit $RepositoryCommit --" in local_recovery,
+        "Failed-build recovery must remain explicit, commit-pinned, and path-confined",
+    )
+    require(
+        "$Text = [IO.File]::ReadAllText($TextFile.FullName)" in local_recovery
+        and "source_commit = $FailedRepositoryCommit" in local_recovery
+        and 'usage_scope = "personal_local_only"' in local_recovery
+        and "distribution_authorized = $false" in local_recovery
+        and "provider_legal_name = $null" in local_recovery
+        and "Expand-Archive -LiteralPath $PartialArchive" in local_recovery
+        and "Get-Sha256 $DownloadedArchive" in local_recovery
+        and "-ExpectedSha256 $ArchiveSha256" in local_recovery,
+        "Failed-build recovery must scan, manifest, verify, copy, and install safely",
+    )
+    require(
+        "Get-ChildItem -LiteralPath $TemporaryRoot" not in local_recovery
+        and "Remove-Item -LiteralPath $BuildTemporaryRoot" not in local_recovery,
+        "Recovery may neither auto-select nor delete a retained failed-build root",
     )
     require(
         '"personal_local_only"' in local_installer
@@ -525,6 +559,10 @@ def main() -> int:
     require(
         workflow.count("persist-credentials: false") == 2,
         "Both checkout steps must discard GitHub credentials before build execution",
+    )
+    require(
+        '"build/resume-hunyuan21-local.ps1"' in workflow,
+        "Hosted static validation must parse the failed-build recovery script",
     )
     require(
         "Compile the repository-owned WinForms adapter" in workflow
