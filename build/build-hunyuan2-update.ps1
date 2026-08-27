@@ -191,6 +191,33 @@ $VendorUnetModule = Join-Path $StageVendorRoot.FullName "hy3dgen\texgen\hunyuanp
 & $BuildPython -I -X utf8 $UnetPatchScript $VendorUnetModule
 
 & $BuildPython -m pip install --no-cache-dir --target $PythonPackages.FullName -r $Requirements
+
+# pip resolves dependencies for --target independently from the build venv.
+# Packages such as Accelerate declare a broad torch dependency, so pip may
+# stage a newer CPU PyTorch even though the portable base already contains the
+# exact CUDA build required by Mujassam AI.  Keep useful transitive
+# dependencies, but remove every file tree owned by that accidental second
+# PyTorch before installing the extension wheels.  Runtime imports then fall
+# through to rt/Lib/site-packages/torch 2.5.1+cu124.
+$AccidentalTorch = @(Get-ChildItem $PythonPackages.FullName -Force | Where-Object {
+    $_.Name -match '^(torch|torchvision|torchaudio)($|[-_.])' -or
+    $_.Name -in @('torchgen', 'functorch')
+})
+if ($AccidentalTorch.Count -gt 0) {
+    Write-Host "Removing target-only PyTorch resolved by pip: $($AccidentalTorch.Name -join ', ')"
+    $AccidentalTorch | Remove-Item -Recurse -Force
+
+    # The accidentally resolved newer torch also selected a newer SymPy than
+    # torch 2.5.1 supports.  The portable base already carries the compatible
+    # SymPy installed alongside its pinned CUDA torch, so do not shadow it.
+    $TargetSymPy = @(Get-ChildItem $PythonPackages.FullName -Force | Where-Object {
+        $_.Name -match '^sympy($|[-_.])'
+    })
+    if ($TargetSymPy.Count -gt 0) {
+        Write-Host "Removing target-only SymPy resolved for the discarded PyTorch: $($TargetSymPy.Name -join ', ')"
+        $TargetSymPy | Remove-Item -Recurse -Force
+    }
+}
 & $BuildPython -m pip install --no-cache-dir --no-deps --target $PythonPackages.FullName $RasterizerWheels[0].FullName $MeshProcessorWheels[0].FullName
 $MeshProcessorModules = @(Get-ChildItem $PythonPackages.FullName -File -Filter "mesh_processor*.pyd")
 if ($MeshProcessorModules.Count -ne 1) {
@@ -199,7 +226,8 @@ if ($MeshProcessorModules.Count -ne 1) {
 $MeshProcessorPackage = Join-Path $StageVendorRoot.FullName "hy3dgen\texgen\differentiable_renderer"
 Move-Item $MeshProcessorModules[0].FullName (Join-Path $MeshProcessorPackage $MeshProcessorModules[0].Name) -Force
 $BundledTorch = @(Get-ChildItem $PythonPackages.FullName -Force | Where-Object {
-    $_.Name -match '^torch($|[-_.])' -or $_.Name -match '^torchvision($|[-_.])'
+    $_.Name -match '^(torch|torchvision|torchaudio)($|[-_.])' -or
+    $_.Name -in @('torchgen', 'functorch')
 })
 if ($BundledTorch.Count -ne 0) {
     throw "The add-on unexpectedly contains a second PyTorch installation: $($BundledTorch.Name -join ', ')"
@@ -256,6 +284,7 @@ Write-Host "Running model-free engine and ABI tests"
 & $BuildPython -I -X utf8 (Join-Path $StageApp "worker.py") --self-test
 & $BuildPython -I -X utf8 (Join-Path $StageEngine "hunyuan2_worker.py") --self-test
 $env:MJ_HY_ENGINE = $StageEngine.FullName
+$env:MJ_EXPECTED_TORCH = $TorchVersion
 $ImportSmokeTest = @'
 import os
 import sys
@@ -263,6 +292,9 @@ import inspect
 root = os.environ["MJ_HY_ENGINE"]
 sys.path.insert(0, os.path.join(root, "python_packages"))
 sys.path.insert(0, os.path.join(root, "vendor", "Hunyuan3D-2"))
+import torch
+assert torch.__version__ == os.environ["MJ_EXPECTED_TORCH"], torch.__version__
+assert os.path.commonpath((os.path.realpath(torch.__file__), os.path.realpath(root))) != os.path.realpath(root)
 import custom_rasterizer
 from hy3dgen.texgen.differentiable_renderer import mesh_processor
 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
