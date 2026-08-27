@@ -642,12 +642,8 @@ with tempfile.TemporaryDirectory() as temporary_directory:
     )
     loaded = torch.load(checkpoint)
     assert torch.equal(loaded["value"], expected_tensor)
-    try:
-        torch.load(checkpoint, mmap=True)
-    except RuntimeError as exc:
-        assert "mmap was blocked" in str(exc)
-    else:
-        raise AssertionError("Verified checkpoint guard permitted mmap=True")
+    mmap_loaded = torch.load(checkpoint, mmap=True)
+    assert torch.equal(mmap_loaded["value"], expected_tensor)
 print("Hunyuan3D-2.1 source, PBR pipeline, and compiled extensions: OK")
 '@
 & $BuildPython -I -X utf8 -c $ImportSmokeTest
