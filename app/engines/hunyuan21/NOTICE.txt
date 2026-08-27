@@ -1,0 +1,22 @@
+Tencent Hunyuan 3D 2.1 is licensed under the Tencent Hunyuan 3D 2.1 Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved. The trademark rights of “Tencent Hunyuan” are owned by Tencent or its affiliate.
+
+Actual provider of this integration: @@MUJASSAM_PROVIDER_LEGAL_NAME@@
+
+Tencent is not affiliated with, associated with, sponsoring, or endorsing this
+independent integration. The complete license is in
+LICENSE-HUNYUAN3D-2.1.txt. Tencent's complete upstream third-party notice is in
+NOTICE-HUNYUAN3D-2.1.txt. Mujassam AI integration changes are described in
+MODIFICATIONS.txt.
+
+This notice does not authorize distribution outside the Territory defined by
+the license. This source-materialized engine must not be placed in a global
+public release; use post-acceptance local materialization or a genuinely
+Territory-restricted distribution channel.
+
+Hosted pull-request validation does not fetch or materialize Tencent source or
+weights. Optional full-build validation is manual, requires explicit
+license/AUP and Territory confirmations, runs only on a Territory-approved
+self-hosted runner, and does not upload or publish its source-materialized
+output. It also remains fail-closed until the complete Windows dependency set
+is locked with SHA-256 hashes. The runner operator is responsible for retaining,
+protecting, or deleting any local build files.

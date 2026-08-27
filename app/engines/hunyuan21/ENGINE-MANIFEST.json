@@ -1,0 +1,166 @@
+{
+  "schema_version": 2,
+  "engine_id": "hunyuan3d_2_1_pbr",
+  "engine": "Hunyuan3D-Shape-2.1 + Hunyuan3D-Paint-2.1 PBR",
+  "source": {
+    "repository": "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1",
+    "commit": "82920d643c0dc2f7bfd7255f45f62d386edfe60c",
+    "distribution_policy": "adapter-only public repository; materialize upstream source locally only after acceptance, or use a channel restricted to the license Territory",
+    "global_public_release_of_upstream_source": false,
+    "license": "Tencent Hunyuan 3D 2.1 Community License Agreement",
+    "upstream_license_path": "LICENSE",
+    "upstream_license_git_blob_sha256": "b79ac5e11ce063b6c6570dbe9686a45a03ba08bd248aa6aa82fb342a23a81c0c",
+    "license_file": "LICENSE-HUNYUAN3D-2.1.txt",
+    "license_file_sha256": "20b7e73b7996a815226ae4c08d18a7891c417749f2de687d1db90b4e36b78789",
+    "required_distribution_notice_file": "NOTICE.txt",
+    "upstream_notice_path": "Notice.txt",
+    "upstream_notice_git_blob_sha256": "ffccf6b539a82e6084d14ff064dadd22d33384d6164b07c0c5a3141810df0350",
+    "upstream_notice_file": "NOTICE-HUNYUAN3D-2.1.txt",
+    "upstream_notice_file_sha256": "7b24e4a03640ff92ef564bd67419eaa181a1e23ae834cf14176b31247348859c",
+    "packaged_legal_text_format": "UTF-8 without BOM, canonical LF, exact upstream Git-blob text plus one packaging LF",
+    "modifications_file": "MODIFICATIONS.txt"
+  },
+  "models": {
+    "hunyuan3d_2_1": {
+      "repository": "tencent/Hunyuan3D-2.1",
+      "revision": "0b94677654c57bb9a6b6845cd7b704ccf551d327",
+      "subfolders": [
+        "hunyuan3d-dit-v2-1",
+        "hunyuan3d-vae-v2-1",
+        "hunyuan3d-paintpbr-v2-1"
+      ],
+      "required_control_files": [
+        {
+          "path": "hunyuan3d-paintpbr-v2-1/model_index.json",
+          "bytes": 617,
+          "sha256": "5b4d5d7cf32171ae93cbed10e2b775419cc2a7cd23c2c2442657c357f454801c",
+          "purpose": "allowlist the local Diffusers component and custom-module mapping"
+        }
+      ],
+      "required_weight_files": [
+        {
+          "path": "hunyuan3d-dit-v2-1/model.fp16.ckpt",
+          "bytes": 7366389768,
+          "sha256": "6b519fc7242f78e9b5f47ea4d55668fe3d944a2d27332f4ca68d29a6ff603f5e",
+          "deserialization": "torch.load(weights_only=True)"
+        },
+        {
+          "path": "hunyuan3d-vae-v2-1/model.fp16.ckpt",
+          "bytes": 655648152,
+          "sha256": "5cbe97f25e6e7abd4bccc80ab07524ec0c86d24118486a9ba49bb5dfb070288a",
+          "deserialization": "torch.load(weights_only=True)"
+        },
+        {
+          "path": "hunyuan3d-paintpbr-v2-1/image_encoder/model.safetensors",
+          "bytes": 1264217240,
+          "sha256": "ae616c24393dd1854372b0639e5541666f7521cbe219669255e865cb7f89466a",
+          "deserialization": "safetensors"
+        },
+        {
+          "path": "hunyuan3d-paintpbr-v2-1/text_encoder/pytorch_model.bin",
+          "bytes": 1361671895,
+          "sha256": "c3e254d7b61353497ea0be2c4013df4ea8f739ee88cffa0ba58cd085459ed565",
+          "deserialization": "torch.load(weights_only=True)"
+        },
+        {
+          "path": "hunyuan3d-paintpbr-v2-1/unet/diffusion_pytorch_model.bin",
+          "bytes": 3925293863,
+          "sha256": "675a1b5cd0098b2002637c443946529c03c5cd54427f40245263350feb3dd5b8",
+          "deserialization": "torch.load(weights_only=True)"
+        },
+        {
+          "path": "hunyuan3d-paintpbr-v2-1/vae/diffusion_pytorch_model.bin",
+          "bytes": 334707217,
+          "sha256": "1b4889b6b1d4ce7ae320a02dedaeff1780ad77d415ea0d744b476155c6377ddc",
+          "deserialization": "torch.load(weights_only=True)"
+        }
+      ]
+    },
+    "dinov2_giant": {
+      "repository": "facebook/dinov2-giant",
+      "revision": "611a9d42f2335e0f921f1e313ad3c1b7178d206d",
+      "license": "Apache-2.0",
+      "required_weight_files": [
+        {
+          "path": "model.safetensors",
+          "bytes": 4546005432,
+          "sha256": "917d3c470db999d32a312f8542149be91c7cbac61ee8fb4b67ae3d82b79ce21f",
+          "deserialization": "safetensors"
+        }
+      ]
+    },
+    "realesrgan_x4plus": {
+      "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+      "bytes": 67040989,
+      "sha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+      "license": "BSD-3-Clause",
+      "deserialization": "torch.load(weights_only=True)"
+    }
+  },
+  "runtime_abi": {
+    "python": "3.11.9",
+    "pytorch": "2.5.1+cu124",
+    "torchvision": "0.20.1+cu124",
+    "cuda_runtime": "12.4",
+    "platform": "win_amd64"
+  },
+  "security_requirements": {
+    "immutable_source_and_model_revisions": true,
+    "verify_bytes_and_sha256_before_deserialization": true,
+    "trust_remote_code": false,
+    "pytorch_weights_only_defense_in_depth": true,
+    "checkpoint_trust_boundary": "only byte-for-byte allowlisted official checkpoints may be deserialized; weights_only is not treated as a substitute for SHA-256 verification",
+    "known_runtime_advisories": [
+      "CVE-2025-32434",
+      "CVE-2026-24747"
+    ],
+    "known_runtime_advisory_details": [
+      {
+        "id": "CVE-2025-32434",
+        "ghsa": "GHSA-53q9-r3pm-6pq6",
+        "affected_runtime": "PyTorch before 2.6.0, including pinned 2.5.1",
+        "fixed_runtime": "2.6.0"
+      },
+      {
+        "id": "CVE-2026-24747",
+        "ghsa": "GHSA-63cw-57p8-fm3p",
+        "affected_runtime": "PyTorch before 2.10.0, including pinned 2.5.1",
+        "fixed_runtime": "2.10.0"
+      }
+    ],
+    "weights_only_is_not_a_safe_pickle_guarantee_for_pinned_runtime": true,
+    "public_release_requires_separate_runtime_abi_and_cve_review": true,
+    "hash_again_immediately_before_each_stage_load": true,
+    "hash_and_deserialize_from_same_open_file_handle": true,
+    "torch_load_mmap_blocked": true,
+    "official_huggingface_endpoint_forced": "https://huggingface.co",
+    "huggingface_endpoint_and_cache_overrides_rejected": true,
+    "download_origin_policy": "fixed official repository IDs and revisions; Hugging Face may select its TLS-protected CDN, but checkpoint acceptance still requires the listed exact bytes and SHA-256",
+    "download_to_staging_then_atomic_promote": true,
+    "reject_reparse_points_in_model_cache_and_job_staging": true,
+    "strict_stage_artifact_paths": true,
+    "full_build_requires_complete_hashed_windows_dependency_lock": true,
+    "automatic_unpinned_updates": false
+  },
+  "license_gate": {
+    "acceptance_version": "hunyuan3d-2.1-v1",
+    "must_not_reuse_hunyuan3d_2_0_acceptance": true,
+    "territory_exclusions": [
+      "European Union",
+      "United Kingdom",
+      "South Korea"
+    ],
+    "requires_explicit_license_and_acceptable_use_policy_acceptance": true,
+    "requires_provider_identity_and_tencent_non_affiliation_disclosure": true,
+    "separate_commercial_license_threshold_monthly_active_users": 1000000,
+    "provider_legal_name_source": "MUJASSAM_PROVIDER_LEGAL_NAME",
+    "source_materialization_license_acceptance_env": "MUJASSAM_HY21_LICENSE_ACCEPTED=1",
+    "source_materialization_territory_confirmation_env": "MUJASSAM_HY21_TERRITORY_CONFIRMED=1",
+    "hosted_pull_request_validation_materializes_upstream_source": false,
+    "manual_full_build_requires_territory_approved_self_hosted_runner": true,
+    "full_build_output_is_not_uploaded_or_published": true,
+    "full_build_output_lifecycle_owned_by_self_hosted_runner_operator": true,
+    "territory_restricted_distribution_must_fail_if_provider_legal_name_is_missing_or_placeholder": true,
+    "public_github_release_with_tencent_source_is_disabled": true
+  }
+}

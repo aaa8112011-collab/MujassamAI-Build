@@ -28,6 +28,17 @@ namespace MujassamPortable
         private const string EngineHunyuanPbr = "hunyuan3d_2_1_pbr";
         private const string EngineSpar3dLegacy = "spar3d_legacy";
         private const string HunyuanAcceptanceFileName = "acceptance-v1.txt";
+        private const string Hunyuan21AcceptanceFileName = "acceptance-v2-1.txt";
+        private const string Hunyuan21AcceptanceVersion = "hunyuan3d-2.1-v1";
+        private const string Hunyuan21SourceCommit =
+            "82920d643c0dc2f7bfd7255f45f62d386edfe60c";
+        private const string Hunyuan21LicenseSha256 =
+            "20b7e73b7996a815226ae4c08d18a7891c417749f2de687d1db90b4e36b78789";
+        // Build workflows must replace this token with the publisher's confirmed
+        // full legal name/entity before compiling a distributable application.
+        private const string Hunyuan21ProviderLegalName = "@@MUJASSAM_PROVIDER_LEGAL_NAME@@";
+        private const string Hunyuan21CiProviderSentinel =
+            "CI validation build — Hunyuan3D 2.1 disabled";
         private const string TextureNative2K = "native_2k";
         private const string TextureAiStudio4K = "ai_4k";
         private const string TextureAiStudio8K = "export_8k";
@@ -387,13 +398,16 @@ namespace MujassamPortable
 
         private void PopulateOptions()
         {
-            bool hunyuanInstalled = IsHunyuanMiniInstalled();
-            engineBox.Items.Add(hunyuanInstalled
+            bool hunyuanMiniInstalled = IsHunyuanMiniInstalled();
+            bool hunyuanPbrInstalled = IsHunyuanPbrInstalled();
+            engineBox.Items.Add(hunyuanMiniInstalled
                 ? "Hunyuan3D 2mini — متاح لـ 8GB (موصى به)"
                 : "Hunyuan3D 2mini — يحتاج تحديث المحرك");
-            engineBox.Items.Add("Hunyuan3D 2.1 PBR — قريبًا (24GB+ VRAM)");
+            engineBox.Items.Add(hunyuanPbrInstalled
+                ? "Hunyuan3D 2.1 Ultimate / PBR — أقوى جودة"
+                : "Hunyuan3D 2.1 Ultimate / PBR — يحتاج تحديث المحرك");
             engineBox.Items.Add("SPAR3D — قديم / احتياطي");
-            engineBox.SelectedIndex = hunyuanInstalled ? 0 : 2;
+            engineBox.SelectedIndex = hunyuanMiniInstalled ? 0 : (hunyuanPbrInstalled ? 1 : 2);
 
             targetBox.Items.Add("Roblox Studio");
             targetBox.Items.Add("Unreal Engine");
@@ -412,7 +426,7 @@ namespace MujassamPortable
             generateButton.Click += StartGeneration;
             cancelButton.Click += CancelGeneration;
             openResultButton.Click += OpenResult;
-            engineBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
+            engineBox.SelectedIndexChanged += delegate { UpdateEngineControls(); };
             targetBox.SelectedIndexChanged += delegate { UpdateTargetControls(); };
             textureBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
             hardwareBox.SelectedIndexChanged += delegate { UpdateOptionsHint(); };
@@ -469,6 +483,17 @@ namespace MujassamPortable
             UpdateOptionsHint();
         }
 
+        private void UpdateEngineControls()
+        {
+            // Ultimate PBR is designed around its full-quality output.  Keep the
+            // user's hardware selection untouched, but choose the matching 4K
+            // texture profile when they switch to this engine.
+            if (engineBox.SelectedIndex == 1 && textureBox.Items.Count > 1 &&
+                textureBox.SelectedIndex != 1)
+                textureBox.SelectedIndex = 1;
+            UpdateOptionsHint();
+        }
+
         private void UpdateOptionsHint()
         {
             if (engineBox.SelectedIndex < 0 || targetBox.SelectedIndex < 0 || textureBox.SelectedIndex < 0 ||
@@ -479,7 +504,9 @@ namespace MujassamPortable
             }
 
             string hardwareHint;
-            if (hardwareBox.SelectedIndex == 1)
+            if (engineBox.SelectedIndex == 1)
+                hardwareHint = "Ultimate يعمل دائمًا بملف الجودة الكامل؛ إعداد Low-VRAM لا يخفّض المحرك";
+            else if (hardwareBox.SelectedIndex == 1)
                 hardwareHint = "8GB متاح فعليًا لـ Hunyuan 2mini عبر Low-VRAM";
             else if (hardwareBox.SelectedIndex == 2)
                 hardwareHint = "16GB+ يفتح الوضع الكامل وتصدير 8K على الجهاز الأقوى";
@@ -490,12 +517,16 @@ namespace MujassamPortable
             if (engineBox.SelectedIndex == 0)
                 engineHint = "Hunyuan3D 2mini متاح على 8GB؛ يستخدم Low-VRAM وقد يستعين بـRAM ويستغرق وقتًا أطول";
             else if (engineBox.SelectedIndex == 1)
-                engineHint = "Hunyuan3D 2.1 PBR قريبًا، ويتطلب جهازًا قويًا بذاكرة 24GB+ VRAM";
+                engineHint = "Hunyuan3D 2.1 Ultimate هو أقوى وضع محلي، وينشئ هندسة كاملة وخامات PBR";
             else
                 engineHint = "SPAR3D هو المحرك القديم الاحتياطي";
 
             string textureHint;
-            if (textureBox.SelectedIndex == 0)
+            if (engineBox.SelectedIndex == 1 && textureBox.SelectedIndex == 0)
+                textureHint = "Native 2K يصغّر خرائط PBR النهائية إلى 2K";
+            else if (engineBox.SelectedIndex == 1 && textureBox.SelectedIndex == 1)
+                textureHint = "AI Studio 4K هو الإعداد الموصى به لخرائط PBR";
+            else if (textureBox.SelectedIndex == 0)
                 textureHint = "Native 2K أسرع بلا ترميم AI";
             else if (textureBox.SelectedIndex == 2)
                 textureHint = "AI 8K مخصص لتصدير Unreal ويحتاج وقتًا وذاكرة أكثر";
@@ -599,18 +630,25 @@ namespace MujassamPortable
                 ShowInputError("اختر مجلد إخراج.");
                 return;
             }
-            if (engineBox.SelectedIndex == 1)
-            {
-                ShowInputError(
-                    "Hunyuan3D 2.1 PBR قريبًا ويتطلب 24GB+ VRAM.\r\n\r\n" +
-                    "اختر Hunyuan3D 2mini؛ فهو متاح الآن على بطاقة 8GB بوضع Low-VRAM.");
-                return;
-            }
             if (engineBox.SelectedIndex == 0 && !IsHunyuanMiniInstalled())
             {
                 ShowInputError(
                     "مكوّن Hunyuan3D غير موجود داخل مجلد البرنامج.\r\n\r\n" +
                     "نزّل تحديث Hunyuan3D واستخرج محتوياته فوق مجلد MujassamAI-Portable ثم افتح البرنامج مجددًا.");
+                return;
+            }
+            if (engineBox.SelectedIndex == 1 && !IsHunyuanPbrInstalled())
+            {
+                ShowInputError(
+                    "مكوّن Hunyuan3D 2.1 Ultimate / PBR غير موجود داخل مجلد البرنامج.\r\n\r\n" +
+                    "نزّل تحديث Ultimate PBR واستخرج محتوياته فوق مجلد MujassamAI-Portable ثم افتح البرنامج مجددًا.");
+                return;
+            }
+            if (engineBox.SelectedIndex == 1 && !IsHunyuan21ProviderConfigured())
+            {
+                ShowInputError(
+                    "بيانات مزوّد Hunyuan3D 2.1 القانونية غير مضمنة في هذه الحزمة.\r\n\r\n" +
+                    "لا يمكن تشغيل Ultimate / PBR من حزمة غير مهيأة للنشر. استخدم إصدارًا رسميًا مكتملًا.");
                 return;
             }
             if (!EnsureHunyuanLicenseAccepted())
@@ -744,6 +782,15 @@ namespace MujassamPortable
                 !Object.Equals(unreal["geometry_mode"], GeometryUnrealOriginal))
                 return "Unreal schema mapping failed.";
 
+            Dictionary<string, object> pbrRoblox = CreateJobPayload(
+                "input.png", "output", 1, 0, 1, 0, 0);
+            if (!Object.Equals(pbrRoblox["engine_mode"], EngineHunyuanPbr) ||
+                !Object.Equals(pbrRoblox["target"], TargetRoblox) ||
+                !Object.Equals(pbrRoblox["texture_mode"], TextureAiStudio4K) ||
+                !Object.Equals(pbrRoblox["hardware_preset"], HardwareAuto) ||
+                !Object.Equals(pbrRoblox["geometry_mode"], GeometryRobloxGameReady))
+                return "Ultimate PBR schema mapping failed.";
+
             Dictionary<string, object> legacy = CreateJobPayload(
                 "input.png", "output", 2, 0, 0, 1, 0);
             if (!Object.Equals(legacy["engine_mode"], EngineSpar3dLegacy))
@@ -759,8 +806,16 @@ namespace MujassamPortable
                 !String.Equals(Path.GetFileName(Path.GetDirectoryName(acceptancePath)), "Licenses",
                     StringComparison.OrdinalIgnoreCase))
                 return "Hunyuan license acceptance path failed.";
-
-            if (roblox.Count != 8 || unreal.Count != 8 || legacy.Count != 8)
+            string pbrAcceptancePath = GetHunyuan21AcceptancePath();
+            if (!Path.IsPathRooted(pbrAcceptancePath) ||
+                !String.Equals(Path.GetFileName(pbrAcceptancePath), Hunyuan21AcceptanceFileName,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(Path.GetFileName(Path.GetDirectoryName(pbrAcceptancePath)), "Licenses",
+                    StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(acceptancePath, pbrAcceptancePath, StringComparison.OrdinalIgnoreCase) ||
+                Hunyuan21SourceCommit.Length != 40 || Hunyuan21LicenseSha256.Length != 64)
+                return "Hunyuan 2.1 license acceptance path failed.";
+            if (roblox.Count != 8 || unreal.Count != 8 || pbrRoblox.Count != 8 || legacy.Count != 8)
                 return "Unexpected job schema field count.";
             return String.Empty;
         }
@@ -777,6 +832,21 @@ namespace MujassamPortable
                 File.Exists(Path.Combine(root, "app", "engines", "hunyuan2", "ENGINE-MANIFEST.json"));
         }
 
+        private static bool IsHunyuanPbrInstalled()
+        {
+            string root = AppDomain.CurrentDomain.BaseDirectory;
+            return File.Exists(Path.Combine(root, "app", "engines", "hunyuan21", "hunyuan21_worker.py")) &&
+                File.Exists(Path.Combine(root, "app", "engines", "hunyuan21", "ENGINE-MANIFEST.json"));
+        }
+
+        private static bool IsHunyuan21ProviderConfigured()
+        {
+            return !String.IsNullOrWhiteSpace(Hunyuan21ProviderLegalName) &&
+                Hunyuan21ProviderLegalName.IndexOf("@@", StringComparison.Ordinal) < 0 &&
+                !String.Equals(Hunyuan21ProviderLegalName, Hunyuan21CiProviderSentinel,
+                    StringComparison.Ordinal);
+        }
+
         internal static string GetHunyuanAcceptancePath()
         {
             string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -785,25 +855,56 @@ namespace MujassamPortable
             return Path.Combine(localAppData, "MujassamAI", "Licenses", HunyuanAcceptanceFileName);
         }
 
+        internal static string GetHunyuan21AcceptancePath()
+        {
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (String.IsNullOrWhiteSpace(localAppData))
+                localAppData = Path.GetTempPath();
+            return Path.Combine(localAppData, "MujassamAI", "Licenses", Hunyuan21AcceptanceFileName);
+        }
+
         private bool EnsureHunyuanLicenseAccepted()
         {
             if (!RequiresHunyuanAcceptance(engineBox.SelectedIndex))
                 return true;
 
-            string acceptancePath = GetHunyuanAcceptancePath();
-            if (File.Exists(acceptancePath))
+            bool hunyuan21 = engineBox.SelectedIndex == 1;
+            string acceptancePath = hunyuan21
+                ? GetHunyuan21AcceptancePath()
+                : GetHunyuanAcceptancePath();
+            if (File.Exists(acceptancePath) &&
+                (!hunyuan21 || IsCurrentHunyuan21Acceptance(acceptancePath)))
                 return true;
 
-            string message =
-                "قبل تشغيل Hunyuan3D، يلزم تأكيد ما يلي:\r\n\r\n" +
-                "• أؤكد أن الاستخدام يتم داخل منطقة يسمح بها الترخيص. " +
-                "الترخيص يستثني الاتحاد الأوروبي (EU) والمملكة المتحدة (UK) وكوريا الجنوبية.\r\n\r\n" +
-                "• أوافق على Tencent Hunyuan 3D 2.0 Community License Agreement.\r\n\r\n" +
-                "اختر نعم للموافقة والمتابعة، أو لا للإلغاء.";
+            string message;
+            string dialogTitle;
+            if (hunyuan21)
+            {
+                dialogTitle = "ترخيص Hunyuan3D 2.1";
+                message =
+                    "قبل تشغيل Hunyuan3D 2.1 Ultimate / PBR، يلزم تأكيد ما يلي:\r\n\r\n" +
+                    "• أؤكد أن الاستخدام يتم خارج الاتحاد الأوروبي (EU) والمملكة المتحدة (UK) " +
+                    "وكوريا الجنوبية، وهي المناطق المستثناة من الترخيص.\r\n\r\n" +
+                    "• قرأت وأوافق على Tencent Hunyuan 3D 2.1 Community License Agreement " +
+                    "وسياسة الاستخدام المقبول المرفقة به.\r\n\r\n" +
+                    "• الاسم القانوني لمزوّد هذا التطبيق والتكامل المحلي هو: " + Hunyuan21ProviderLegalName +
+                    ". Tencent غير مرتبطة بهذا المنتج ولا تشاركه أو ترعاه أو تؤيده.\r\n\r\n" +
+                    "اختر نعم للموافقة والمتابعة، أو لا للإلغاء.";
+            }
+            else
+            {
+                dialogTitle = "ترخيص Hunyuan3D";
+                message =
+                    "قبل تشغيل Hunyuan3D، يلزم تأكيد ما يلي:\r\n\r\n" +
+                    "• أؤكد أن الاستخدام يتم داخل منطقة يسمح بها الترخيص. " +
+                    "الترخيص يستثني الاتحاد الأوروبي (EU) والمملكة المتحدة (UK) وكوريا الجنوبية.\r\n\r\n" +
+                    "• أوافق على Tencent Hunyuan 3D 2.0 Community License Agreement.\r\n\r\n" +
+                    "اختر نعم للموافقة والمتابعة، أو لا للإلغاء.";
+            }
             DialogResult answer = MessageBox.Show(
                 this,
                 message,
-                "ترخيص Hunyuan3D",
+                dialogTitle,
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Information,
                 MessageBoxDefaultButton.Button2);
@@ -815,14 +916,34 @@ namespace MujassamPortable
                 string directory = Path.GetDirectoryName(acceptancePath);
                 Directory.CreateDirectory(directory);
                 string temporaryPath = acceptancePath + ".new";
-                string record =
-                    "MujassamAI Hunyuan acceptance v1\r\n" +
-                    "license=Tencent Hunyuan 3D 2.0 Community License Agreement\r\n" +
-                    "territory_confirmation=outside EU, UK, and South Korea\r\n" +
-                    "accepted_utc=" + DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) + "\r\n";
+                string record;
+                if (hunyuan21)
+                {
+                    record =
+                        "MujassamAI Hunyuan acceptance v2.1\r\n" +
+                        "acceptance_version=" + Hunyuan21AcceptanceVersion + "\r\n" +
+                        "source_commit=" + Hunyuan21SourceCommit + "\r\n" +
+                        "license=Tencent Hunyuan 3D 2.1 Community License Agreement\r\n" +
+                        "license_sha256=" + Hunyuan21LicenseSha256 + "\r\n" +
+                        "territory_confirmation=outside EU, UK, and South Korea\r\n" +
+                        "license_terms_acknowledged=true\r\n" +
+                        "acceptable_use_policy_acknowledged=true\r\n" +
+                        "provider_legal_name=" + Hunyuan21ProviderLegalName + "\r\n" +
+                        "provider_disclosure_acknowledged=true\r\n" +
+                        "tencent_non_affiliation_acknowledged=true\r\n" +
+                        "accepted_utc=" + DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) + "\r\n";
+                }
+                else
+                {
+                    record =
+                        "MujassamAI Hunyuan acceptance v1\r\n" +
+                        "license=Tencent Hunyuan 3D 2.0 Community License Agreement\r\n" +
+                        "territory_confirmation=outside EU, UK, and South Korea\r\n" +
+                        "accepted_utc=" + DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) + "\r\n";
+                }
                 File.WriteAllText(temporaryPath, record, new UTF8Encoding(false));
                 if (File.Exists(acceptancePath))
-                    File.Delete(temporaryPath);
+                    File.Replace(temporaryPath, acceptancePath, null);
                 else
                     File.Move(temporaryPath, acceptancePath);
                 return File.Exists(acceptancePath);
@@ -832,9 +953,65 @@ namespace MujassamPortable
                 MessageBox.Show(
                     this,
                     "تعذر حفظ موافقة الترخيص، لذلك لن يبدأ Hunyuan3D.\r\n\r\n" + ex.Message,
-                    "ترخيص Hunyuan3D",
+                    dialogTitle,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
+                return false;
+            }
+        }
+
+        private static bool IsCurrentHunyuan21Acceptance(string path)
+        {
+            try
+            {
+                FileInfo file = new FileInfo(path);
+                if (!file.Exists || file.Length <= 0 || file.Length > 16384)
+                    return false;
+                string[] acceptanceLines = File.ReadAllLines(path, Encoding.UTF8);
+                HashSet<string> lines = new HashSet<string>(
+                    acceptanceLines,
+                    StringComparer.Ordinal);
+                string[] acceptedUtcLines = Array.FindAll(
+                    acceptanceLines,
+                    delegate(string line)
+                    {
+                        return line.StartsWith("accepted_utc=", StringComparison.Ordinal);
+                    });
+                string acceptedUtc = acceptedUtcLines.Length == 1
+                    ? acceptedUtcLines[0].Substring("accepted_utc=".Length)
+                    : String.Empty;
+                bool hasExplicitTimeZone =
+                    acceptedUtc.EndsWith("Z", StringComparison.OrdinalIgnoreCase) ||
+                    (acceptedUtc.Length >= 6 &&
+                     (acceptedUtc[acceptedUtc.Length - 6] == '+' ||
+                      acceptedUtc[acceptedUtc.Length - 6] == '-') &&
+                     acceptedUtc[acceptedUtc.Length - 3] == ':' &&
+                     Char.IsDigit(acceptedUtc[acceptedUtc.Length - 5]) &&
+                     Char.IsDigit(acceptedUtc[acceptedUtc.Length - 4]) &&
+                     Char.IsDigit(acceptedUtc[acceptedUtc.Length - 2]) &&
+                     Char.IsDigit(acceptedUtc[acceptedUtc.Length - 1]));
+                DateTimeOffset parsedAcceptedUtc;
+                bool acceptedUtcValid = hasExplicitTimeZone && DateTimeOffset.TryParse(
+                    acceptedUtc,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    out parsedAcceptedUtc) &&
+                    parsedAcceptedUtc.ToUniversalTime() <= DateTimeOffset.UtcNow.AddMinutes(5);
+                return lines.Contains("MujassamAI Hunyuan acceptance v2.1") &&
+                    lines.Contains("acceptance_version=" + Hunyuan21AcceptanceVersion) &&
+                    lines.Contains("source_commit=" + Hunyuan21SourceCommit) &&
+                    lines.Contains("license=Tencent Hunyuan 3D 2.1 Community License Agreement") &&
+                    lines.Contains("license_sha256=" + Hunyuan21LicenseSha256) &&
+                    lines.Contains("territory_confirmation=outside EU, UK, and South Korea") &&
+                    lines.Contains("license_terms_acknowledged=true") &&
+                    lines.Contains("acceptable_use_policy_acknowledged=true") &&
+                    lines.Contains("provider_legal_name=" + Hunyuan21ProviderLegalName) &&
+                    lines.Contains("provider_disclosure_acknowledged=true") &&
+                    lines.Contains("tencent_non_affiliation_acknowledged=true") &&
+                    acceptedUtcValid;
+            }
+            catch (Exception)
+            {
                 return false;
             }
         }
@@ -850,7 +1027,7 @@ namespace MujassamPortable
             if (engineBox.SelectedIndex == 0)
                 statusLabel.Text = "جارٍ تشغيل Hunyuan3D 2mini على وضع 8GB Low-VRAM...";
             else if (engineBox.SelectedIndex == 1)
-                statusLabel.Text = "Hunyuan3D 2.1 PBR قريبًا (24GB+ VRAM)";
+                statusLabel.Text = "جارٍ تشغيل Hunyuan3D 2.1 Ultimate / PBR بأعلى جودة...";
             else
                 statusLabel.Text = "جارٍ تشغيل SPAR3D الاحتياطي...";
             logBox.Clear();

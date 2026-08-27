@@ -1,4 +1,4 @@
-Mujassam AI Portable 0.4.0 Hunyuan Low-VRAM
+Mujassam AI Portable 0.5.0 Hunyuan3D 2.1 PBR
 SPAR3D source: fdc311b16809e6a8adc2f5a3407ebb3db1a95bd1
 SPAR3D model: 5699918cb34f55cd7d828493d2725f3038313761
 Python: 3.11.9 application-local x64
@@ -11,3 +11,7 @@ Quality UI: Native 2K / AI 4K / Unreal AI 8K; Auto / 8GB / 16GB+
 Default engine: Hunyuan3D 2mini + Hunyuan3D Paint 2.0, staged 8GB Low-VRAM
 Hunyuan source: f8db63096c8282cb27354314d896feba5ba6ff8a
 Hunyuan model weights: downloaded once from pinned official Hugging Face revisions
+Optional engine: Hunyuan3D Shape 2.1 + Paint 2.1 PBR
+Hunyuan3D 2.1 source: 82920d643c0dc2f7bfd7255f45f62d386edfe60c
+Hunyuan3D 2.1 model: 0b94677654c57bb9a6b6845cd7b704ccf551d327
+Hunyuan3D 2.1 distribution: adapter-only public Git repository; no global source-materialized Release

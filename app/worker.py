@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Portable SPAR3D worker used by MujassamAI.
+"""Portable 3D engine router and legacy SPAR3D worker used by MujassamAI.
 
 The worker accepts one JSON request file and communicates with the launcher only
 through the line-oriented MJ* protocol on stdout.  The gated SPAR3D model and
@@ -45,7 +45,7 @@ ENGINE_MODES = {
 }
 ENGINE_DISPLAY_NAMES = {
     "hunyuan3d_2mini_low_vram": "Hunyuan3D 2mini Low-VRAM",
-    "hunyuan3d_2_1_pbr": "Hunyuan3D 2.1 PBR",
+    "hunyuan3d_2_1_pbr": "Hunyuan3D 2.1 Ultimate PBR",
     "spar3d_legacy": "SPAR3D",
 }
 TEXTURE_MODES = {
@@ -69,6 +69,11 @@ BACKGROUND_CHECKPOINT = (
     BUNDLE_ROOT / "models" / "transparent-background" / "ckpt_base.pth"
 )
 HUNYUAN2_WORKER = APP_ROOT / "engines" / "hunyuan2" / "hunyuan2_worker.py"
+HUNYUAN21_WORKER = APP_ROOT / "engines" / "hunyuan21" / "hunyuan21_worker.py"
+HUNYUAN_WORKERS = {
+    "hunyuan3d_2mini_low_vram": HUNYUAN2_WORKER,
+    "hunyuan3d_2_1_pbr": HUNYUAN21_WORKER,
+}
 
 MODEL_CONFIG_NAME = "config.yaml"
 MODEL_WEIGHT_NAME = "model.safetensors"
@@ -98,7 +103,8 @@ DINO_CONFIG_KWARGS = {
 }
 
 _SENSITIVE_PATTERN = re.compile(
-    r"(?i)(?:hf_[a-z0-9]{12,}|bearer\s+[a-z0-9._~+/=-]{12,}|"
+    r"(?i)(?:https?://[^/\s:@]+:[^/\s@]+@|hf_[a-z0-9]{12,}|"
+    r"bearer\s+[a-z0-9._~+/=-]{12,}|"
     r"(?:token|secret|password|authorization)\s*[:=]\s*[^\s|]+)"
 )
 
@@ -1376,15 +1382,20 @@ def _run_job(job: Job) -> Path:
             _safe_remove_staging(staging, job.output_dir)
 
 
-def _run_hunyuan2_component(request_path: Path) -> int:
-    """Run Hunyuan in its own process and relay the existing MJ protocol."""
+def _run_hunyuan_component(request_path: Path, engine_mode: str) -> int:
+    """Run the selected Hunyuan engine in its own process and relay MJ output."""
+
+    component_path = HUNYUAN_WORKERS.get(engine_mode)
+    if component_path is None:
+        raise WorkerError("engine-mode", "The selected Hunyuan engine is invalid")
 
     try:
-        component = HUNYUAN2_WORKER.resolve(strict=True)
+        component = component_path.resolve(strict=True)
     except OSError as exc:
         raise WorkerError(
             "engine-component-missing",
-            "Hunyuan3D is selected, but its engine update is not installed",
+            f"{ENGINE_DISPLAY_NAMES[engine_mode]} is selected, but its engine "
+            "update is not installed",
         ) from exc
     if not component.is_file() or not _is_within(component, APP_ROOT):
         raise WorkerError(
@@ -1430,7 +1441,10 @@ def _run_hunyuan2_component(request_path: Path) -> int:
             if not error_stream and raw.startswith(
                 ("MJPROGRESS|", "MJARTIFACT|", "MJERROR|", "MJSTAGEOOM|")
             ):
-                cleaned = raw[:2000]
+                # Preserve the line protocol separators, but never trust a
+                # component to have redacted credentials before relaying them
+                # into the GUI log.
+                cleaned = _SENSITIVE_PATTERN.sub("[redacted]", raw)[:2000]
             else:
                 cleaned = _sanitize(raw, 2000)
             print(cleaned, file=sys.stderr if error_stream else sys.stdout, flush=True)
@@ -1508,6 +1522,17 @@ def _self_test() -> int:
         (DINO_REPOSITORY == "facebook/dinov2-large", "DINOv2 repository"),
         (len(DINO_REVISION) == 40, "DINOv2 revision"),
         (len(DINO_WEIGHT_SHA256) == 64, "DINOv2 weight digest"),
+        (
+            "proxy-user" not in _sanitize(
+                "https://proxy-user:proxy-password@example.invalid/ "
+                "authorization=hf_abcdefghijklmnop"
+            )
+            and _sanitize(
+                "https://proxy-user:proxy-password@example.invalid/ "
+                "authorization=hf_abcdefghijklmnop"
+            ).count("[redacted]") == 2,
+            "credential redaction",
+        ),
         (HUB_DOWNLOAD_TIMEOUT_SECONDS == 300, "download timeout"),
         (HUB_ETAG_TIMEOUT_SECONDS == 60, "metadata timeout"),
         (MAX_SAFETENSORS_HEADER_BYTES == 64 * 1024 * 1024, "model header limit"),
@@ -1517,6 +1542,20 @@ def _self_test() -> int:
             BACKGROUND_CHECKPOINT
             == BUNDLE_ROOT / "models" / "transparent-background" / "ckpt_base.pth",
             "background checkpoint path",
+        ),
+        (
+            HUNYUAN_WORKERS
+            == {
+                "hunyuan3d_2mini_low_vram": APP_ROOT
+                / "engines"
+                / "hunyuan2"
+                / "hunyuan2_worker.py",
+                "hunyuan3d_2_1_pbr": APP_ROOT
+                / "engines"
+                / "hunyuan21"
+                / "hunyuan21_worker.py",
+            },
+            "Hunyuan engine dispatch paths",
         ),
     ]
     failed = [label for passed, label in checks if not passed]
@@ -1528,7 +1567,7 @@ def _self_test() -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="MujassamAI portable SPAR3D worker")
+    parser = argparse.ArgumentParser(description="MujassamAI portable 3D engine worker")
     parser.add_argument("request", nargs="?", help="Path to the JSON request")
     parser.add_argument(
         "--job",
@@ -1568,8 +1607,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = _load_request(Path(request_value))
         job = _parse_job(payload)
-        if job.engine_mode == "hunyuan3d_2mini_low_vram":
-            return _run_hunyuan2_component(Path(request_value))
+        if job.engine_mode in HUNYUAN_WORKERS:
+            return _run_hunyuan_component(Path(request_value), job.engine_mode)
         _run_job(job)
         return 0
     except WorkerError as exc:
