@@ -160,6 +160,7 @@ jobs:
           $ArchiveFile = Get-Item $Archive
           $ArchiveHash = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
           $Parts = [Collections.Generic.List[object]]::new()
+          $SplitBytes = [Int64]0
           $Buffer = New-Object byte[] ([Int32]$env:PART_BYTES)
           $Input = [IO.File]::OpenRead($Archive)
           try {
@@ -176,12 +177,23 @@ jobs:
                       bytes = [Int64]$Read
                       sha256 = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant()
                   })
+                  $SplitBytes += [Int64]$Read
                   $Index++
               }
           }
           finally { $Input.Dispose() }
-          if ($Parts.Count -lt 2 -or
-              ($Parts | Measure-Object bytes -Sum).Sum -ne $ArchiveFile.Length) {
+          $MeasuredPartBytes = [Int64]0
+          foreach ($PartRecord in $Parts) {
+              $PartFile = Get-Item -LiteralPath (Join-Path $Output ([string]$PartRecord['name']))
+              if ($PartFile.Length -ne [Int64]$PartRecord['bytes']) {
+                  throw "Written release part length mismatch: $($PartFile.Name)"
+              }
+              $MeasuredPartBytes += [Int64]$PartFile.Length
+          }
+          Write-Host "Split $($ArchiveFile.Length) bytes into $($Parts.Count) part(s); counted $SplitBytes and measured $MeasuredPartBytes bytes."
+          if ($Parts.Count -lt 1 -or
+              $SplitBytes -ne [Int64]$ArchiveFile.Length -or
+              $MeasuredPartBytes -ne [Int64]$ArchiveFile.Length) {
               throw "ZIP splitting failed"
           }
 
