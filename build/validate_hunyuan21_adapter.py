@@ -230,6 +230,12 @@ def main() -> int:
         "_force_weights_only_torch_load" in worker_text,
         "Engine worker checkpoint guard is missing",
     )
+    require(
+        'if not isinstance(source, (str, os.PathLike)) and hasattr(source, "name"):'
+        in worker_text
+        and "result = probe.load(own_path)" in worker_text,
+        "Checkpoint guard must preserve pathlib.Path parent directories",
+    )
     preflight = worker_text.find('_validate_base_runtime(payload["texture_mode"])')
     prepare = worker_text.find("image_info = _prepare_image")
     download = worker_text.find("model_root, dino_root, downloaded = _download_models")
