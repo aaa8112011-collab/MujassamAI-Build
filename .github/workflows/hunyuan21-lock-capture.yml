@@ -25,6 +25,7 @@ jobs:
 
       - name: Resolve, hash, and verify Windows wheels
         id: locks
+        continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -33,6 +34,8 @@ jobs:
           $Helper = Join-Path $env:GITHUB_WORKSPACE "build/materialize_hunyuan21_lock.py"
           $RuntimeInput = Join-Path $env:GITHUB_WORKSPACE "build/hunyuan21.requirements.lock.txt"
           New-Item -ItemType Directory -Path $Root | Out-Null
+          $Transcript = Join-Path $Root "capture-transcript.txt"
+          Start-Transcript -Path $Transcript -Force | Out-Null
 
           function New-LockVenv([string]$Name) {
             $Path = Join-Path $Root $Name
@@ -129,12 +132,15 @@ jobs:
           $BuildBase64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($BuildLock))
           "runtime=$RuntimeBase64" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "build=$BuildBase64" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Stop-Transcript | Out-Null
 
       - name: Return verified locks to this pull request
+        if: always()
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          LOCK_OUTCOME: ${{ steps.locks.outcome }}
           RUNTIME_LOCK: ${{ steps.locks.outputs.runtime }}
           BUILD_LOCK: ${{ steps.locks.outputs.build }}
         run: |
@@ -142,11 +148,22 @@ jobs:
           if ($env:PR_NUMBER -notmatch '^[1-9][0-9]*$') {
             throw "Invalid pull request number"
           }
+          $Transcript = Join-Path $env:RUNNER_TEMP `
+              "hy21-lock-capture/capture-transcript.txt"
+          $Diagnostic = ""
+          if (Test-Path $Transcript -PathType Leaf) {
+            $Text = Get-Content $Transcript -Raw
+            if ($Text.Length -gt 24000) { $Text = $Text.Substring($Text.Length - 24000) }
+            $Diagnostic = [Convert]::ToBase64String(
+                [Text.Encoding]::UTF8.GetBytes($Text))
+          }
           $Body = @(
             "<!-- hy21-lock-capture -->",
             "Verified on windows-2022 / CPython 3.11.9 x64.",
+            "LOCK_OUTCOME=$($env:LOCK_OUTCOME)",
             "RUNTIME_LOCK_BASE64=$($env:RUNTIME_LOCK)",
-            "BUILD_LOCK_BASE64=$($env:BUILD_LOCK)"
+            "BUILD_LOCK_BASE64=$($env:BUILD_LOCK)",
+            "DIAGNOSTIC_BASE64=$Diagnostic"
           ) -join "`n"
           $Payload = @{ body = $Body } | ConvertTo-Json -Compress
           $Headers = @{
