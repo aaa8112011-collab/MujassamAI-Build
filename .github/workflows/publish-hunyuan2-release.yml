@@ -235,7 +235,14 @@ jobs:
               if (-not $Source.Contains($Pair.Key)) { throw "Missing source marker $($Pair.Key)" }
               $Source = $Source.Replace($Pair.Key, $Pair.Value)
           }
-          if ($Source.Contains("@@")) { throw "Updater contains an unresolved marker" }
+          $UnresolvedMarkers = @(
+              [regex]::Matches($Source, '@@[A-Z][A-Z0-9_]*@@') |
+                  ForEach-Object { $_.Value } |
+                  Sort-Object -Unique
+          )
+          if ($UnresolvedMarkers.Count -gt 0) {
+              throw "Updater contains unresolved marker(s): $($UnresolvedMarkers -join ', ')"
+          }
           $Patched = Join-Path $Work "HunyuanUpdateSetup.cs"
           [IO.File]::WriteAllText($Patched, $Source, [Text.UTF8Encoding]::new($false))
 
