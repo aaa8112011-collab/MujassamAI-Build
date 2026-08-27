@@ -64,23 +64,52 @@ jobs:
               throw "Pinned artifact manifest metadata is invalid"
           }
 
+          $Seen = [Collections.Generic.HashSet[string]]::new(
+              [StringComparer]::OrdinalIgnoreCase)
           $Expected = [Collections.Generic.HashSet[string]]::new(
               [StringComparer]::OrdinalIgnoreCase)
+          $VerifiedEntries = [Collections.Generic.List[object]]::new()
           foreach ($Entry in $Payload.files) {
               $Relative = [string]$Entry.path
               if ($Relative -notmatch '^[A-Za-z0-9_. /+()-]+$' -or
+                  $Relative.StartsWith('/') -or
                   $Relative -match '(^|/)\.\.(/|$)' -or
-                  -not $Expected.Add($Relative)) {
+                  -not $Seen.Add($Relative)) {
                   throw "Unsafe or duplicate payload path: $Relative"
               }
               $Native = $Relative.Replace([char]'/', [IO.Path]::DirectorySeparatorChar)
-              $File = Get-Item (Join-Path $Stage $Native)
+              $Candidate = Join-Path $Stage $Native
+              if (-not (Test-Path $Candidate -PathType Leaf)) {
+                  $HasHiddenSegment = @($Relative.Split('/') | Where-Object {
+                      $_ -match '^\.'
+                  }).Count -gt 0
+                  if (-not $HasHiddenSegment) {
+                      throw "Pinned artifact is missing a non-hidden payload file: $Relative"
+                  }
+                  Write-Host "::notice::Omitting hidden non-runtime file excluded by upload-artifact: $Relative"
+                  continue
+              }
+              $File = Get-Item $Candidate
               $Digest = (Get-FileHash $File.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
               if ($File.Length -ne [Int64]$Entry.bytes -or
                   $Digest -cne [string]$Entry.sha256) {
                   throw "Payload verification failed: $Relative"
               }
+              if (-not $Expected.Add($Relative)) {
+                  throw "Duplicate verified payload path: $Relative"
+              }
+              $VerifiedEntries.Add($Entry)
           }
+          if ($VerifiedEntries.Count -eq 0) {
+              throw "Pinned artifact contains no verified payload files"
+          }
+          # upload-artifact v4 excludes dot-files unless explicitly enabled. The
+          # successful pinned build predates that option, so remove only missing
+          # dot-path entries and publish a manifest matching the actual artifact.
+          $Payload.files = $VerifiedEntries.ToArray()
+          $NormalizedJson = $Payload | ConvertTo-Json -Depth 8
+          [IO.File]::WriteAllText(
+              $ManifestPath, $NormalizedJson, [Text.UTF8Encoding]::new($false))
           foreach ($Required in @(
               "MujassamAI.exe",
               "app/worker.py",
