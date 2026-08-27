@@ -4,6 +4,12 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+if ($PSVersionTable.PSVersion -lt [version]"7.4") {
+    throw (
+        "Hunyuan3D-2.1 building requires PowerShell 7.4 or newer so native " +
+        "git, Python, pip, compiler, and CUDA failures stop the build reliably"
+    )
+}
 $PSNativeCommandUseErrorActionPreference = $true
 
 $SourceCommit = "82920d643c0dc2f7bfd7255f45f62d386edfe60c"
@@ -35,21 +41,47 @@ $Requirements = Join-Path $RepositoryRoot "build\hunyuan21.requirements.lock.txt
 $BuildRequirements = Join-Path $RepositoryRoot `
     "build\hunyuan21.build.requirements.lock.txt"
 $PatchScript = Join-Path $RepositoryRoot "build\patch_hunyuan21_windows.py"
-$ProviderLegalName = if ([string]::IsNullOrWhiteSpace(
+$PersonalLocalUse = $env:MUJASSAM_HY21_LOCAL_PERSONAL_USE -ceq "1"
+$UsageScope = if ($PersonalLocalUse) {
+    "personal_local_only"
+} else {
+    "third_party_provider"
+}
+$ConfiguredProvider = if ([string]::IsNullOrWhiteSpace(
     $env:MUJASSAM_PROVIDER_LEGAL_NAME)) {
-    "CI validation build — Hunyuan3D 2.1 disabled"
+    ""
 } else {
     $env:MUJASSAM_PROVIDER_LEGAL_NAME.Trim()
 }
-$InvalidProviderCharacters = @($ProviderLegalName.ToCharArray() | Where-Object {
+if ($PersonalLocalUse) {
+    if (-not [string]::IsNullOrWhiteSpace($ConfiguredProvider)) {
+        throw (
+            "A personal-local-only build must not configure or store a " +
+            "third-party provider legal name"
+        )
+    }
+    $ProviderLegalName = $null
+    $ProviderTokenValue = "not applicable (personal local use only)"
+} else {
+    $ProviderLegalName = $ConfiguredProvider
+    if ([string]::IsNullOrWhiteSpace($ProviderLegalName) -or
+        $ProviderLegalName -ceq "CI validation build — Hunyuan3D 2.1 disabled") {
+        throw (
+            "Third-party Hunyuan3D-2.1 builds require the provider's actual " +
+            "full legal name in MUJASSAM_PROVIDER_LEGAL_NAME"
+        )
+    }
+    $ProviderTokenValue = $ProviderLegalName
+}
+$InvalidProviderCharacters = @($ProviderTokenValue.ToCharArray() | Where-Object {
     [char]::IsControl($_) -or
     [char]::GetUnicodeCategory($_) -in @(
         [Globalization.UnicodeCategory]::LineSeparator,
         [Globalization.UnicodeCategory]::ParagraphSeparator
     )
 })
-if ($InvalidProviderCharacters.Count -ne 0 -or $ProviderLegalName.Contains("@@")) {
-    throw "MUJASSAM_PROVIDER_LEGAL_NAME contains a line/control character or build marker"
+if ($InvalidProviderCharacters.Count -ne 0 -or $ProviderTokenValue.Contains("@@")) {
+    throw "The configured Hunyuan3D-2.1 provider value is unsafe"
 }
 
 function Get-NormalizedLegalText([string]$Path) {
@@ -59,6 +91,41 @@ function Get-NormalizedLegalText([string]$Path) {
         throw "Legal text contains NUL: $Path"
     }
     return $Text
+}
+
+function Assert-CompleteSha256Lock([string]$Path, [string]$Label) {
+    if (-not (Test-Path $Path -PathType Leaf)) {
+        throw "Missing $Label dependency lock: $Path"
+    }
+    $Seen = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    $Count = 0
+    $LineNumber = 0
+    foreach ($RawLine in [IO.File]::ReadAllLines($Path)) {
+        $LineNumber++
+        $Line = $RawLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($Line) -or $Line.StartsWith("#")) {
+            continue
+        }
+        if ($Line -notmatch (
+            '^([A-Za-z0-9_.-]+)==([^\s]+) --hash=sha256:([0-9a-f]{64})$'
+        )) {
+            throw (
+                "$Label lock entry must be one exact wheel pin and one lowercase " +
+                "SHA-256 at ${Path}:$LineNumber"
+            )
+        }
+        $NormalizedName = [regex]::Replace(
+            $Matches[1].ToLowerInvariant(), '[-_.]+', '-')
+        if (-not $Seen.Add($NormalizedName)) {
+            throw "Duplicate package in $Label dependency lock: $($Matches[1])"
+        }
+        $Count++
+    }
+    if ($Count -eq 0) {
+        throw "$Label dependency lock contains no packages: $Path"
+    }
+    return $Count
 }
 
 foreach ($Path in @(
@@ -87,19 +154,19 @@ foreach ($Path in @(
         throw "Missing required Hunyuan3D-2.1 packaging file: $Path"
     }
 }
-$RequirementsText = Get-Content $Requirements -Raw
-$UseHashedRequirements = $RequirementsText.Contains("--hash=sha256:")
 $RequireHashedDependencies = `
     $env:MUJASSAM_REQUIRE_HASHED_DEPENDENCIES -eq "1"
-$UseHashedBuildRequirements = (
-    (Test-Path $BuildRequirements -PathType Leaf) -and
+$UseHashedRequirements = (Get-Content $Requirements -Raw).Contains("--hash=sha256:")
+$UseHashedBuildRequirements = (Test-Path $BuildRequirements -PathType Leaf) -and
     (Get-Content $BuildRequirements -Raw).Contains("--hash=sha256:")
-)
-if ($RequireHashedDependencies -and
-    (-not $UseHashedRequirements -or -not $UseHashedBuildRequirements)) {
+if ($RequireHashedDependencies) {
+    $RuntimeLockCount = Assert-CompleteSha256Lock $Requirements "runtime"
+    $BuildLockCount = Assert-CompleteSha256Lock $BuildRequirements "build"
+    Write-Host "Verified dependency lock syntax: $RuntimeLockCount runtime, $BuildLockCount build"
+} elseif ($UseHashedRequirements -or $UseHashedBuildRequirements) {
     throw (
-        "Distributable Hunyuan3D-2.1 packaging requires complete CPython 3.11 " +
-        "win_amd64 SHA-256 locks for both runtime and build dependencies"
+        "Hashed Hunyuan3D-2.1 locks may only be used when " +
+        "MUJASSAM_REQUIRE_HASHED_DEPENDENCIES=1"
     )
 }
 # Fetching the upstream source is itself use/reproduction under the Hunyuan
@@ -214,7 +281,9 @@ Write-Host "Creating pinned Python build environment"
 python -m venv $BuildVenv
 $BuildPython = Join-Path $BuildVenv "Scripts\python.exe"
 if ($RequireHashedDependencies) {
-    & $BuildPython -m pip install --no-cache-dir --require-hashes `
+    & $BuildPython -m pip install --disable-pip-version-check --no-cache-dir `
+        --only-binary=:all: --require-hashes `
+        --extra-index-url https://download.pytorch.org/whl/cu124 `
         -r $BuildRequirements
 } else {
     # Local, non-distributable developer fallback.  The validation workflow
@@ -329,6 +398,12 @@ $DistributionNoticePath = Join-Path $StageEngine "NOTICE.txt"
 $DistributionNoticeText = Get-Content $DistributionNoticePath -Raw
 $DistributionNoticeText = $DistributionNoticeText.Replace(
     "`r`n", "`n").Replace("`r", "`n")
+$UsageScopeToken = "@@MUJASSAM_HY21_USAGE_SCOPE@@"
+$UsageScopeTokenCount = [regex]::Matches(
+    $DistributionNoticeText, [regex]::Escape($UsageScopeToken)).Count
+if ($UsageScopeTokenCount -ne 1) {
+    throw "Expected one usage-scope token in Hunyuan3D-2.1 NOTICE, found $UsageScopeTokenCount"
+}
 $DistributionNoticeToken = "@@MUJASSAM_PROVIDER_LEGAL_NAME@@"
 $DistributionNoticeTokenCount = [regex]::Matches(
     $DistributionNoticeText, [regex]::Escape($DistributionNoticeToken)).Count
@@ -336,7 +411,9 @@ if ($DistributionNoticeTokenCount -ne 1) {
     throw "Expected one provider legal-name token in Hunyuan3D-2.1 NOTICE, found $DistributionNoticeTokenCount"
 }
 $DistributionNoticeText = $DistributionNoticeText.Replace(
-    $DistributionNoticeToken, $ProviderLegalName)
+    $UsageScopeToken, $UsageScope)
+$DistributionNoticeText = $DistributionNoticeText.Replace(
+    $DistributionNoticeToken, $ProviderTokenValue)
 [IO.File]::WriteAllText(
     $DistributionNoticePath, $DistributionNoticeText,
     [Text.UTF8Encoding]::new($false))
@@ -449,17 +526,32 @@ $AppManifest = @'
 '@
 [IO.File]::WriteAllText($ManifestPath, $AppManifest, [Text.UTF8Encoding]::new($false))
 $MainFormSource = Get-Content (Join-Path $RepositoryRoot "app\MainForm.cs") -Raw
+$MainFormUsageToken = "@@MUJASSAM_HY21_USAGE_SCOPE@@"
+$MainFormUsageTokenCount = [regex]::Matches(
+    $MainFormSource, [regex]::Escape($MainFormUsageToken)).Count
+if ($MainFormUsageTokenCount -ne 1) {
+    throw "Expected one usage-scope token in MainForm.cs, found $MainFormUsageTokenCount"
+}
 $ProviderToken = "@@MUJASSAM_PROVIDER_LEGAL_NAME@@"
 $ProviderTokenCount = [regex]::Matches(
     $MainFormSource, [regex]::Escape($ProviderToken)).Count
 if ($ProviderTokenCount -ne 1) {
     throw "Expected one provider legal-name token in MainForm.cs, found $ProviderTokenCount"
 }
-$EscapedProviderLegalName = $ProviderLegalName.Replace("\", "\\").Replace('"', '\"')
+$EscapedProviderLegalName = $ProviderTokenValue.Replace("\", "\\").Replace('"', '\"')
+$MainFormSource = $MainFormSource.Replace($MainFormUsageToken, $UsageScope)
 $MainFormSource = $MainFormSource.Replace(
     $ProviderToken, $EscapedProviderLegalName)
-if ($MainFormSource.Contains("@@")) {
-    throw "Compiled MainForm.cs contains an unresolved build marker"
+$UnresolvedMainFormMarkers = @(
+    [regex]::Matches($MainFormSource, '@@[A-Z][A-Z0-9_]*@@') |
+        ForEach-Object { $_.Value } |
+        Sort-Object -Unique
+)
+if ($UnresolvedMainFormMarkers.Count -ne 0) {
+    throw (
+        "Compiled MainForm.cs contains unresolved build marker(s): " +
+        ($UnresolvedMainFormMarkers -join ", ")
+    )
 }
 $PatchedMainForm = Join-Path $BuildRoot "MainForm.cs"
 [IO.File]::WriteAllText(
@@ -599,13 +691,19 @@ foreach ($Relative in $RequiredFiles) {
 }
 
 $TextExtensions = @(".py", ".json", ".txt", ".md", ".yaml", ".yml", ".manifest")
-$UnresolvedMarkerFiles = @(Get-ChildItem $Stage -Recurse -File | Where-Object {
+$UnresolvedMarkerDetails = @(Get-ChildItem $Stage -Recurse -File | Where-Object {
     $_.Extension.ToLowerInvariant() -in $TextExtensions
-} | Where-Object {
-    (Get-Content $_.FullName -Raw).Contains("@@")
+} | ForEach-Object {
+    $MarkerMatches = @([regex]::Matches(
+        (Get-Content $_.FullName -Raw), '@@[A-Z][A-Z0-9_]*@@') |
+        ForEach-Object { $_.Value } |
+        Sort-Object -Unique)
+    if ($MarkerMatches.Count -ne 0) {
+        "$($_.FullName): $($MarkerMatches -join ', ')"
+    }
 })
-if ($UnresolvedMarkerFiles.Count -ne 0) {
-    throw "Staged update contains unresolved marker(s): $($UnresolvedMarkerFiles.FullName -join ', ')"
+if ($UnresolvedMarkerDetails.Count -ne 0) {
+    throw "Staged update contains unresolved marker(s): $($UnresolvedMarkerDetails -join '; ')"
 }
 
 $Entries = @(Get-ChildItem $Stage -Recurse -File | Sort-Object FullName | ForEach-Object {
@@ -623,6 +721,9 @@ $UpdateManifest = [ordered]@{
     product = "Mujassam AI Hunyuan3D-2.1 Shape + PBR engine"
     source_commit = $env:GITHUB_SHA
     upstream_commit = $SourceCommit
+    usage_scope = $UsageScope
+    # This build manifest records provenance; it never grants distribution rights.
+    distribution_authorized = $false
     provider_legal_name = $ProviderLegalName
     archive = $ArchiveName
     files = $Entries

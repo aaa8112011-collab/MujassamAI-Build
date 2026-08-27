@@ -46,6 +46,14 @@ The full-build path also fails closed before source fetch or package execution
 until a complete Windows direct-and-transitive dependency lock with SHA-256
 hashes is present.
 
+For a purely personal build that remains on the user's local device and is not
+provided as a product, service, integration, or functionality to any third
+party, Mujassam AI records `usage_scope=personal_local_only`, stores no provider
+legal name, and records `distribution_authorized=false`. This mode does not
+authorize redistribution. A third-party product/service build uses the separate
+`third_party_provider` scope and still requires the actual provider identity and
+non-affiliation disclosure described below.
+
 The Hunyuan3D 2.1 license defines a Territory that excludes the European Union,
 United Kingdom, and South Korea; it also includes use restrictions and separate
 commercial terms for a licensee whose products or services exceeded one million

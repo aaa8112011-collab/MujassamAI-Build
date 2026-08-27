@@ -60,6 +60,22 @@ jobs:
           python app/worker.py --self-test
           if ($LASTEXITCODE -ne 0) { throw "Base worker self-test failed" }
 
+          foreach ($ScriptPath in @(
+            "build/build-hunyuan21-update.ps1",
+            "build/build-hunyuan21-local.ps1",
+            "installer/install-hunyuan21-local.ps1",
+            "installer/restore-hunyuan21-local.ps1"
+          )) {
+            $Tokens = $null
+            $Errors = $null
+            [Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $ScriptPath), [ref]$Tokens, [ref]$Errors) | Out-Null
+            if ($Errors.Count -ne 0) {
+              $Messages = @($Errors | ForEach-Object { $_.Message }) -join "; "
+              throw "PowerShell syntax failed for ${ScriptPath}: $Messages"
+            }
+          }
+
       - name: Compile the repository-owned WinForms adapter
         shell: pwsh
         run: |
@@ -107,7 +123,9 @@ jobs:
       PART_BYTES: "50331648"
       # Tencent source may not be published through a globally accessible
       # GitHub artifact/Release. It remains local to this approved runner.
-      MUJASSAM_PROVIDER_LEGAL_NAME: CI validation build — Hunyuan3D 2.1 disabled
+      # Any source-materialized output from this non-publishing validation is
+      # personal/local to its Territory-approved runner operator.
+      MUJASSAM_HY21_LOCAL_PERSONAL_USE: "1"
       # Fail before source fetch or pip execution until every Windows runtime
       # dependency and transitive wheel has an approved SHA-256 lock entry.
       MUJASSAM_REQUIRE_HASHED_DEPENDENCIES: "1"
@@ -141,7 +159,10 @@ jobs:
           if ($StageManifest.schema_version -ne 1 -or
               $StageManifest.archive -ne $env:ARCHIVE_NAME -or
               $StageManifest.source_commit -ne $env:GITHUB_SHA -or
-              $StageManifest.provider_legal_name -ne $env:MUJASSAM_PROVIDER_LEGAL_NAME -or
+              $StageManifest.usage_scope -ne "personal_local_only" -or
+              $StageManifest.distribution_authorized -ne $false -or
+              -not [string]::IsNullOrWhiteSpace(
+                [string]$StageManifest.provider_legal_name) -or
               @($StageManifest.files).Count -eq 0) {
             throw "Built update manifest metadata is invalid"
           }
@@ -181,7 +202,9 @@ jobs:
             release_tag = $env:RELEASE_TAG
             source_run_id = [Int64]$env:GITHUB_RUN_ID
             source_commit = $env:GITHUB_SHA
-            provider_legal_name = $env:MUJASSAM_PROVIDER_LEGAL_NAME
+            usage_scope = "personal_local_only"
+            distribution_authorized = $false
+            provider_legal_name = $null
             archive = [ordered]@{
               file_name = $env:ARCHIVE_NAME
               bytes = [Int64]$Archive.Length

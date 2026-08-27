@@ -68,6 +68,9 @@ DOWNLOAD_STATUS_SECONDS = 30
 MIN_FREE_DOWNLOAD_BYTES = 32 * 1024**3
 LICENSE_SHA256 = "20b7e73b7996a815226ae4c08d18a7891c417749f2de687d1db90b4e36b78789"
 UPSTREAM_NOTICE_SHA256 = "7b24e4a03640ff92ef564bd67419eaa181a1e23ae834cf14176b31247348859c"
+PERSONAL_LOCAL_USAGE_SCOPE = "personal_local_only"
+THIRD_PARTY_USAGE_SCOPE = "third_party_provider"
+CI_PROVIDER_SENTINEL = "CI validation build — Hunyuan3D 2.1 disabled"
 REALESRGAN_X4_BYTES = 67_040_989
 REALESRGAN_X4_SHA256 = "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"
 REALESRGAN_X2_BYTES = 67_061_725
@@ -396,7 +399,8 @@ def _validate_license_acceptance() -> Path:
         size = path.stat().st_size
         if size < 128 or size > 16_384:
             raise ValueError("acceptance record has an invalid size")
-        lines = set(path.read_text(encoding="utf-8-sig").splitlines())
+        acceptance_lines = path.read_text(encoding="utf-8-sig").splitlines()
+        lines = set(acceptance_lines)
     except (OSError, UnicodeError, ValueError) as exc:
         raise EngineError(
             "license-not-accepted",
@@ -413,21 +417,65 @@ def _validate_license_acceptance() -> Path:
         "territory_confirmation=outside EU, UK, and South Korea",
         "license_terms_acknowledged=true",
         "acceptable_use_policy_acknowledged=true",
-        "provider_disclosure_acknowledged=true",
         "tencent_non_affiliation_acknowledged=true",
     }
-    provider_lines = [line for line in lines if line.startswith("provider_legal_name=")]
-    provider = provider_lines[0].partition("=")[2].strip() if len(provider_lines) == 1 else ""
+    scope_lines = [
+        line for line in acceptance_lines if line.startswith("usage_scope=")
+    ]
+    usage_scope = (
+        scope_lines[0].partition("=")[2].strip() if len(scope_lines) == 1 else ""
+    )
+    provider_lines = [
+        line for line in acceptance_lines if line.startswith("provider_legal_name=")
+    ]
+    provider = (
+        provider_lines[0].partition("=")[2].strip()
+        if len(provider_lines) == 1
+        else ""
+    )
+    provider_disclosure_lines = [
+        line
+        for line in acceptance_lines
+        if line.startswith("provider_disclosure_acknowledged=")
+    ]
+    distribution_lines = [
+        line
+        for line in acceptance_lines
+        if line.startswith("distribution_authorized=")
+    ]
     notice_path = ENGINE_ROOT / "NOTICE.txt"
     try:
         notice_text = notice_path.read_text(encoding="utf-8-sig")
-        prefix = "Actual provider of this integration: "
-        notice_lines = [line for line in notice_text.splitlines() if line.startswith(prefix)]
-        notice_provider = notice_lines[0][len(prefix) :].strip() if len(notice_lines) == 1 else ""
+        notice_text_lines = notice_text.splitlines()
+        scope_prefix = "Configured usage scope: "
+        notice_scope_lines = [
+            line for line in notice_text_lines if line.startswith(scope_prefix)
+        ]
+        notice_scope = (
+            notice_scope_lines[0][len(scope_prefix) :].strip()
+            if len(notice_scope_lines) == 1
+            else ""
+        )
+        provider_prefix = "Actual provider of this integration: "
+        notice_provider_lines = [
+            line for line in notice_text_lines if line.startswith(provider_prefix)
+        ]
+        notice_provider = (
+            notice_provider_lines[0][len(provider_prefix) :].strip()
+            if len(notice_provider_lines) == 1
+            else ""
+        )
     except (OSError, UnicodeError):
+        notice_scope = ""
         notice_provider = ""
-    accepted_lines = [line for line in lines if line.startswith("accepted_utc=")]
-    accepted_utc = accepted_lines[0].partition("=")[2].strip() if len(accepted_lines) == 1 else ""
+    accepted_lines = [
+        line for line in acceptance_lines if line.startswith("accepted_utc=")
+    ]
+    accepted_utc = (
+        accepted_lines[0].partition("=")[2].strip()
+        if len(accepted_lines) == 1
+        else ""
+    )
     try:
         parsed_accepted = datetime.fromisoformat(accepted_utc.replace("Z", "+00:00"))
         timestamp_valid = (
@@ -437,18 +485,35 @@ def _validate_license_acceptance() -> Path:
         )
     except ValueError:
         timestamp_valid = False
-    if (
-        not required.issubset(lines)
-        or not provider
-        or provider != notice_provider
-        or "@@" in notice_provider
-        or notice_provider == "CI validation build — Hunyuan3D 2.1 disabled"
-        or not timestamp_valid
-    ):
+    common_valid = (
+        required.issubset(lines)
+        and usage_scope == notice_scope
+        and usage_scope in {PERSONAL_LOCAL_USAGE_SCOPE, THIRD_PARTY_USAGE_SCOPE}
+        and timestamp_valid
+    )
+    if usage_scope == PERSONAL_LOCAL_USAGE_SCOPE:
+        scope_valid = (
+            not provider_lines
+            and not provider_disclosure_lines
+            and distribution_lines == ["distribution_authorized=false"]
+        )
+    else:
+        scope_valid = (
+            usage_scope == THIRD_PARTY_USAGE_SCOPE
+            and provider_disclosure_lines == ["provider_disclosure_acknowledged=true"]
+            and len(provider_lines) == 1
+            and bool(provider)
+            and provider == notice_provider
+            and not distribution_lines
+            and "@@" not in notice_provider
+            and notice_provider != CI_PROVIDER_SENTINEL
+        )
+    if not common_valid or not scope_valid:
         raise EngineError(
             "license-not-accepted",
             "The saved Hunyuan3D 2.1 acceptance is missing the current license, "
-            "territory, or provider confirmation; accept it again in Mujassam AI",
+            "territory, usage-scope, or provider confirmation; accept it again "
+            "in Mujassam AI",
         )
     return path
 

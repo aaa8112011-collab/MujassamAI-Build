@@ -34,8 +34,15 @@ namespace MujassamPortable
             "82920d643c0dc2f7bfd7255f45f62d386edfe60c";
         private const string Hunyuan21LicenseSha256 =
             "20b7e73b7996a815226ae4c08d18a7891c417749f2de687d1db90b4e36b78789";
+        // Build workflows must replace this token with exactly one reviewed
+        // deployment scope. Personal-local builds do not designate a provider
+        // and must never be distributed or offered as functionality to others.
+        private const string Hunyuan21UsageScope = "@@MUJASSAM_HY21_USAGE_SCOPE@@";
+        private const string Hunyuan21PersonalLocalUsageScope = "personal_local_only";
+        private const string Hunyuan21ThirdPartyUsageScope = "third_party_provider";
         // Build workflows must replace this token with the publisher's confirmed
-        // full legal name/entity before compiling a distributable application.
+        // full legal name/entity before compiling a third-party application.
+        // It is deliberately unused in a personal-local-only build.
         private const string Hunyuan21ProviderLegalName = "@@MUJASSAM_PROVIDER_LEGAL_NAME@@";
         private const string Hunyuan21CiProviderSentinel =
             "CI validation build — Hunyuan3D 2.1 disabled";
@@ -644,11 +651,12 @@ namespace MujassamPortable
                     "نزّل تحديث Ultimate PBR واستخرج محتوياته فوق مجلد MujassamAI-Portable ثم افتح البرنامج مجددًا.");
                 return;
             }
-            if (engineBox.SelectedIndex == 1 && !IsHunyuan21ProviderConfigured())
+            if (engineBox.SelectedIndex == 1 && !IsHunyuan21DeploymentConfigured())
             {
                 ShowInputError(
-                    "بيانات مزوّد Hunyuan3D 2.1 القانونية غير مضمنة في هذه الحزمة.\r\n\r\n" +
-                    "لا يمكن تشغيل Ultimate / PBR من حزمة غير مهيأة للنشر. استخدم إصدارًا رسميًا مكتملًا.");
+                    "نطاق استخدام Hunyuan3D 2.1 غير مهيأ في هذه الحزمة، أو أن بيانات المزوّد " +
+                    "القانونية المطلوبة لنمط الطرف الثالث غير مكتملة.\r\n\r\n" +
+                    "استخدم حزمة محلية شخصية مهيأة صراحةً، أو إصدار طرف ثالث رسميًا مكتملًا.");
                 return;
             }
             if (!EnsureHunyuanLicenseAccepted())
@@ -847,6 +855,24 @@ namespace MujassamPortable
                     StringComparison.Ordinal);
         }
 
+        private static bool IsHunyuan21PersonalLocalMode()
+        {
+            return String.Equals(Hunyuan21UsageScope,
+                Hunyuan21PersonalLocalUsageScope, StringComparison.Ordinal);
+        }
+
+        private static bool IsHunyuan21ThirdPartyMode()
+        {
+            return String.Equals(Hunyuan21UsageScope,
+                Hunyuan21ThirdPartyUsageScope, StringComparison.Ordinal);
+        }
+
+        private static bool IsHunyuan21DeploymentConfigured()
+        {
+            return IsHunyuan21PersonalLocalMode() ||
+                (IsHunyuan21ThirdPartyMode() && IsHunyuan21ProviderConfigured());
+        }
+
         internal static string GetHunyuanAcceptancePath()
         {
             string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -881,15 +907,32 @@ namespace MujassamPortable
             if (hunyuan21)
             {
                 dialogTitle = "ترخيص Hunyuan3D 2.1";
-                message =
-                    "قبل تشغيل Hunyuan3D 2.1 Ultimate / PBR، يلزم تأكيد ما يلي:\r\n\r\n" +
-                    "• أؤكد أن الاستخدام يتم خارج الاتحاد الأوروبي (EU) والمملكة المتحدة (UK) " +
-                    "وكوريا الجنوبية، وهي المناطق المستثناة من الترخيص.\r\n\r\n" +
-                    "• قرأت وأوافق على Tencent Hunyuan 3D 2.1 Community License Agreement " +
-                    "وسياسة الاستخدام المقبول المرفقة به.\r\n\r\n" +
-                    "• الاسم القانوني لمزوّد هذا التطبيق والتكامل المحلي هو: " + Hunyuan21ProviderLegalName +
-                    ". Tencent غير مرتبطة بهذا المنتج ولا تشاركه أو ترعاه أو تؤيده.\r\n\r\n" +
-                    "اختر نعم للموافقة والمتابعة، أو لا للإلغاء.";
+                if (IsHunyuan21PersonalLocalMode())
+                {
+                    message =
+                        "قبل تشغيل Hunyuan3D 2.1 Ultimate / PBR، يلزم تأكيد ما يلي:\r\n\r\n" +
+                        "• أؤكد أن الاستخدام يتم خارج الاتحاد الأوروبي (EU) والمملكة المتحدة (UK) " +
+                        "وكوريا الجنوبية، وهي المناطق المستثناة من الترخيص.\r\n\r\n" +
+                        "• قرأت وأوافق على Tencent Hunyuan 3D 2.1 Community License Agreement " +
+                        "وسياسة الاستخدام المقبول المرفقة به.\r\n\r\n" +
+                        "• هذه الحزمة مهيأة للاستخدام الشخصي المحلي فقط. لن أوزع الحزمة أو المحرك، " +
+                        "ولن أوفر تكاملها أو وظائفها لأي طرف ثالث. هذه الموافقة لا تمنح إذنًا بالتوزيع.\r\n\r\n" +
+                        "• Tencent غير مرتبطة بهذا المنتج ولا تشاركه أو ترعاه أو تؤيده.\r\n\r\n" +
+                        "اختر نعم للموافقة والمتابعة، أو لا للإلغاء.";
+                }
+                else
+                {
+                    message =
+                        "قبل تشغيل Hunyuan3D 2.1 Ultimate / PBR، يلزم تأكيد ما يلي:\r\n\r\n" +
+                        "• أؤكد أن الاستخدام يتم خارج الاتحاد الأوروبي (EU) والمملكة المتحدة (UK) " +
+                        "وكوريا الجنوبية، وهي المناطق المستثناة من الترخيص.\r\n\r\n" +
+                        "• قرأت وأوافق على Tencent Hunyuan 3D 2.1 Community License Agreement " +
+                        "وسياسة الاستخدام المقبول المرفقة به.\r\n\r\n" +
+                        "• الاسم القانوني لمزوّد هذا التطبيق هو: " + Hunyuan21ProviderLegalName +
+                        ". أقر بإفصاح المزوّد، وأن Tencent غير مرتبطة بهذا المنتج ولا تشاركه أو " +
+                        "ترعاه أو تؤيده.\r\n\r\n" +
+                        "اختر نعم للموافقة والمتابعة، أو لا للإلغاء.";
+                }
             }
             else
             {
@@ -928,9 +971,21 @@ namespace MujassamPortable
                         "territory_confirmation=outside EU, UK, and South Korea\r\n" +
                         "license_terms_acknowledged=true\r\n" +
                         "acceptable_use_policy_acknowledged=true\r\n" +
-                        "provider_legal_name=" + Hunyuan21ProviderLegalName + "\r\n" +
-                        "provider_disclosure_acknowledged=true\r\n" +
-                        "tencent_non_affiliation_acknowledged=true\r\n" +
+                        "usage_scope=" + Hunyuan21UsageScope + "\r\n";
+                    if (IsHunyuan21PersonalLocalMode())
+                    {
+                        record +=
+                            "distribution_authorized=false\r\n" +
+                            "tencent_non_affiliation_acknowledged=true\r\n";
+                    }
+                    else
+                    {
+                        record +=
+                            "provider_legal_name=" + Hunyuan21ProviderLegalName + "\r\n" +
+                            "provider_disclosure_acknowledged=true\r\n" +
+                            "tencent_non_affiliation_acknowledged=true\r\n";
+                    }
+                    record +=
                         "accepted_utc=" + DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture) + "\r\n";
                 }
                 else
@@ -997,7 +1052,9 @@ namespace MujassamPortable
                     DateTimeStyles.None,
                     out parsedAcceptedUtc) &&
                     parsedAcceptedUtc.ToUniversalTime() <= DateTimeOffset.UtcNow.AddMinutes(5);
-                return lines.Contains("MujassamAI Hunyuan acceptance v2.1") &&
+                bool commonAcceptanceValid =
+                    IsHunyuan21DeploymentConfigured() &&
+                    lines.Contains("MujassamAI Hunyuan acceptance v2.1") &&
                     lines.Contains("acceptance_version=" + Hunyuan21AcceptanceVersion) &&
                     lines.Contains("source_commit=" + Hunyuan21SourceCommit) &&
                     lines.Contains("license=Tencent Hunyuan 3D 2.1 Community License Agreement") &&
@@ -1005,10 +1062,44 @@ namespace MujassamPortable
                     lines.Contains("territory_confirmation=outside EU, UK, and South Korea") &&
                     lines.Contains("license_terms_acknowledged=true") &&
                     lines.Contains("acceptable_use_policy_acknowledged=true") &&
-                    lines.Contains("provider_legal_name=" + Hunyuan21ProviderLegalName) &&
-                    lines.Contains("provider_disclosure_acknowledged=true") &&
+                    lines.Contains("usage_scope=" + Hunyuan21UsageScope) &&
                     lines.Contains("tencent_non_affiliation_acknowledged=true") &&
                     acceptedUtcValid;
+                if (!commonAcceptanceValid)
+                    return false;
+
+                string[] providerLines = Array.FindAll(
+                    acceptanceLines,
+                    delegate(string line)
+                    {
+                        return line.StartsWith("provider_legal_name=", StringComparison.Ordinal) ||
+                            line.StartsWith("provider_disclosure_acknowledged=", StringComparison.Ordinal);
+                    });
+                string[] usageScopeLines = Array.FindAll(
+                    acceptanceLines,
+                    delegate(string line)
+                    {
+                        return line.StartsWith("usage_scope=", StringComparison.Ordinal);
+                    });
+                string[] distributionLines = Array.FindAll(
+                    acceptanceLines,
+                    delegate(string line)
+                    {
+                        return line.StartsWith("distribution_authorized=", StringComparison.Ordinal);
+                    });
+                if (usageScopeLines.Length != 1)
+                    return false;
+                if (IsHunyuan21PersonalLocalMode())
+                {
+                    return providerLines.Length == 0 &&
+                        distributionLines.Length == 1 &&
+                        distributionLines[0] == "distribution_authorized=false";
+                }
+                return IsHunyuan21ThirdPartyMode() &&
+                    providerLines.Length == 2 &&
+                    distributionLines.Length == 0 &&
+                    lines.Contains("provider_legal_name=" + Hunyuan21ProviderLegalName) &&
+                    lines.Contains("provider_disclosure_acknowledged=true");
             }
             catch (Exception)
             {
