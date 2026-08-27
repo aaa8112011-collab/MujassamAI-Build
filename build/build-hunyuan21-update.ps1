@@ -702,6 +702,7 @@ foreach ($Relative in $RequiredFiles) {
 }
 
 $TextExtensions = @(".py", ".json", ".txt", ".md", ".yaml", ".yml", ".manifest")
+$MujassamMarkerPattern = '@@MUJASSAM_[A-Z][A-Z0-9_]*@@'
 $UnresolvedMarkerDetails = @(Get-ChildItem $Stage -Recurse -File | Where-Object {
     $_.Extension.ToLowerInvariant() -in $TextExtensions
 } | ForEach-Object {
@@ -710,7 +711,7 @@ $UnresolvedMarkerDetails = @(Get-ChildItem $Stage -Recurse -File | Where-Object 
     # preserves it as an empty string so the marker scan remains well-defined.
     $Text = [IO.File]::ReadAllText($TextFile.FullName)
     $MarkerMatches = @([regex]::Matches(
-        $Text, '@@[A-Z][A-Z0-9_]*@@') |
+        $Text, $MujassamMarkerPattern) |
         ForEach-Object { $_.Value } |
         Sort-Object -Unique)
     if ($MarkerMatches.Count -ne 0) {

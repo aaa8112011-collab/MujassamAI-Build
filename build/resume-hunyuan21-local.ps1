@@ -254,13 +254,14 @@ if (-not (Test-Path -LiteralPath $GuiExecutable -PathType Leaf) -or
 }
 
 $TextExtensions = @(".py", ".json", ".txt", ".md", ".yaml", ".yml", ".manifest")
+$MujassamMarkerPattern = '@@MUJASSAM_[A-Z][A-Z0-9_]*@@'
 $UnresolvedMarkerDetails = @(Get-ChildItem -LiteralPath $Stage -Recurse -File |
     Where-Object { $_.Extension.ToLowerInvariant() -in $TextExtensions } |
     ForEach-Object {
         $TextFile = $_
         $Text = [IO.File]::ReadAllText($TextFile.FullName)
         $MarkerMatches = @([regex]::Matches(
-            $Text, '@@[A-Z][A-Z0-9_]*@@') |
+            $Text, $MujassamMarkerPattern) |
             ForEach-Object { $_.Value } |
             Sort-Object -Unique)
         if ($MarkerMatches.Count -ne 0) {
