@@ -43,7 +43,7 @@ jobs:
             python -m venv $Path
             $Python = Join-Path $Path "Scripts/python.exe"
             & $Python -m pip install --disable-pip-version-check --no-cache-dir `
-                --only-binary=:all: "pip==24.3.1"
+                --only-binary=:all: "pip==24.3.1" | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "Failed to pin pip in $Name" }
             return $Python
           }
