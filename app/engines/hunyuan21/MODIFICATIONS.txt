@@ -29,6 +29,8 @@ source, Mujassam AI changes it only as needed for the following integration:
   checkpoint;
 * replacement of upstream OmegaConf-only inference configuration reads with
   a small PyYAML compatibility layer, avoiding source-only build dependencies;
+* removal of the unused PyTorch Lightning training wrapper from the staged
+  Paint package exports while preserving the inference pipeline and modules;
 * an explicit personal_local_only acceptance scope that stores no provider
   identity and never authorizes distribution or third-party functionality;
 * complete CPython 3.11 win_amd64 runtime/build wheel locks with one exact

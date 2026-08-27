@@ -600,6 +600,14 @@ import custom_rasterizer
 from DifferentiableRenderer import mesh_inpaint_processor
 from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
 from hy3dshape.postprocessors import DegenerateFaceRemover, FaceReducer, FloaterRemover
+import importlib.metadata
+import trimesh
+assert importlib.metadata.version("pymeshlab") == "2022.2.post3"
+mesh_smoke = trimesh.creation.icosphere(subdivisions=1)
+mesh_smoke = FaceReducer()(mesh_smoke, max_facenum=20)
+mesh_smoke = FloaterRemover()(mesh_smoke)
+mesh_smoke = DegenerateFaceRemover()(mesh_smoke)
+assert isinstance(mesh_smoke, trimesh.Trimesh) and len(mesh_smoke.faces) > 0
 import inspect
 from quality.realesrgan_x2 import REALESRGAN_X4PLUS, load_realesrgan_x4plus
 assert REALESRGAN_X4PLUS.sha256 == "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"
@@ -607,6 +615,8 @@ assert "basicsr" not in sys.modules and "realesrgan" not in sys.modules
 from utils.image_super_utils import imageSuperNet
 assert "load_realesrgan_x4plus" in inspect.getsource(imageSuperNet.__init__)
 from textureGenPipeline import Hunyuan3DPaintConfig, Hunyuan3DPaintPipeline
+from hunyuanpaintpbr.unet.modules import Dino_v2
+assert "pytorch_lightning" not in sys.modules
 
 # Exercise the engine's exact checkpoint guard against the packaged PyTorch
 # ABI.  In particular, this proves that torch.load accepts the same verified

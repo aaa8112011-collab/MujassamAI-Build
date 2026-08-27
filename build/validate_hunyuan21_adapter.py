@@ -425,6 +425,29 @@ def main() -> int:
         "Runtime packaging must use the complete wheel lock and self-contained x4 inference",
     )
     require(
+        'importlib.metadata.version("pymeshlab") == "2022.2.post3"'
+        in build_script
+        and "mesh_smoke = FaceReducer()(mesh_smoke, max_facenum=20)"
+        in build_script
+        and "mesh_smoke = FloaterRemover()(mesh_smoke)" in build_script
+        and "mesh_smoke = DegenerateFaceRemover()(mesh_smoke)" in build_script,
+        "Full-build smoke test must exercise the pinned PyMeshLab postprocessors",
+    )
+    require(
+        "from hunyuanpaintpbr.unet.modules import Dino_v2" in build_script
+        and '"pytorch_lightning" not in sys.modules' in build_script,
+        "Full-build smoke test must cover the inference-only Paint package exports",
+    )
+    vendor_patch = (ROOT / "build" / "patch_hunyuan21_windows.py").read_text(
+        encoding="utf-8"
+    )
+    require(
+        "training-only PyTorch Lightning wrapper" in vendor_patch
+        and 'paint_package = root / "hy3dpaint" / "hunyuanpaintpbr" / "__init__.py"'
+        in vendor_patch,
+        "Staged Paint package must exclude the unused training-only wrapper",
+    )
+    require(
         '$env:MUJASSAM_HY21_LOCAL_PERSONAL_USE -ceq "1"' in build_script
         and '$UsageScope = if ($PersonalLocalUse)' in build_script
         and '$UsageScopeToken = "@@MUJASSAM_HY21_USAGE_SCOPE@@"' in build_script
