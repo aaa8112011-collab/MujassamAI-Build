@@ -37,6 +37,61 @@ def patch_source_tree(root: Path) -> None:
 
 
 def patch_staged_vendor(root: Path) -> None:
+    shape_misc = root / "hy3dshape" / "hy3dshape" / "utils" / "misc.py"
+    replace_once(
+        shape_misc,
+        "from omegaconf import OmegaConf, DictConfig, ListConfig\n",
+        '''# Modified by Mujassam AI: inference uses reviewed PyYAML wheels only;
+# OmegaConf's ANTLR source-only dependency is unnecessary for the portable path.
+import yaml
+
+DictConfig = dict
+ListConfig = list
+''',
+        "remove the inference-time OmegaConf dependency",
+    )
+    replace_once(
+        shape_misc,
+        '''def get_config_from_file(config_file: str) -> Union[DictConfig, ListConfig]:
+    config_file = OmegaConf.load(config_file)
+
+    if 'base_config' in config_file.keys():
+        if config_file['base_config'] == "default_base":
+            base_config = OmegaConf.create()
+            # base_config = get_default_config()
+        elif config_file['base_config'].endswith(".yaml"):
+            base_config = get_config_from_file(config_file['base_config'])
+        else:
+            raise ValueError(f"{config_file} must be `.yaml` file or it contains `base_config` key.")
+
+        config_file = {key: value for key, value in config_file if key != "base_config"}
+
+        return OmegaConf.merge(base_config, config_file)
+
+    return config_file
+''',
+        '''def get_config_from_file(config_file: str) -> Union[DictConfig, ListConfig]:
+    with open(config_file, "r", encoding="utf-8") as stream:
+        loaded = yaml.safe_load(stream)
+    if not isinstance(loaded, (dict, list)):
+        raise ValueError(f"{config_file} must contain a YAML mapping or list")
+    if isinstance(loaded, dict) and "base_config" in loaded:
+        base_reference = loaded.pop("base_config")
+        if base_reference == "default_base":
+            base_config = {}
+        elif isinstance(base_reference, str) and base_reference.endswith(".yaml"):
+            base_config = get_config_from_file(base_reference)
+        else:
+            raise ValueError(f"{config_file} contains an invalid base_config")
+        if not isinstance(base_config, dict):
+            raise ValueError("base_config must resolve to a YAML mapping")
+        base_config.update(loaded)
+        return base_config
+    return loaded
+''',
+        "replace OmegaConf config loading with PyYAML",
+    )
+
     mesh_utils = root / "hy3dpaint" / "DifferentiableRenderer" / "mesh_utils.py"
     replace_once(
         mesh_utils,
@@ -130,6 +185,38 @@ def patch_staged_vendor(root: Path) -> None:
         "import huggingface_hub\n",
         "",
         "remove runtime network snapshot downloads",
+    )
+    replace_once(
+        multiview,
+        "from omegaconf import OmegaConf\n",
+        '''# Modified by Mujassam AI: avoid OmegaConf/ANTLR in inference.
+import yaml
+
+
+class _ConfigNode(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+def _config_node(value):
+    if isinstance(value, dict):
+        return _ConfigNode({key: _config_node(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return [_config_node(item) for item in value]
+    return value
+''',
+        "replace Paint OmegaConf with a small PyYAML mapping",
+    )
+    replace_once(
+        multiview,
+        "        cfg = OmegaConf.load(cfg_path)\n",
+        '''        with open(cfg_path, "r", encoding="utf-8") as stream:
+            cfg = _config_node(yaml.safe_load(stream))
+''',
+        "load the Paint configuration through PyYAML",
     )
     replace_once(
         multiview,

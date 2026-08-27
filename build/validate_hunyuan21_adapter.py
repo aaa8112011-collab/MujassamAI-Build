@@ -238,7 +238,12 @@ def main() -> int:
     requirements = (ROOT / "build" / "hunyuan21.requirements.lock.txt").read_text(
         encoding="utf-8"
     )
-    for forbidden_runtime_package in ("basicsr", "realesrgan", "pymeshlab"):
+    for forbidden_runtime_package in (
+        "basicsr",
+        "realesrgan",
+        "pymeshlab",
+        "omegaconf",
+    ):
         require(
             re.search(
                 rf"(?mi)^{re.escape(forbidden_runtime_package)}==", requirements

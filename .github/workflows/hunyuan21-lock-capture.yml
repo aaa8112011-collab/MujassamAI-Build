@@ -126,7 +126,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Runtime hash-lock replay failed" }
           $env:PYTHONPATH = $RuntimeTarget
           & $VerifyPython -I -X utf8 -c `
-              "import sys; sys.path.insert(0, r'$RuntimeTarget'); import accelerate, cv2, diffusers, numpy, omegaconf, PIL, pygltflib, pymeshlab, safetensors, scipy, skimage, timm, tokenizers, torchdiffeq, transformers, trimesh, xatlas, yaml; print('HY21_WINDOWS_LOCKS_OK')"
+              "import sys; sys.path.insert(0, r'$RuntimeTarget'); import accelerate, cv2, diffusers, numpy, PIL, pygltflib, safetensors, scipy, skimage, timm, tokenizers, torchdiffeq, transformers, trimesh, xatlas, yaml; print('HY21_WINDOWS_LOCKS_OK')"
           if ($LASTEXITCODE -ne 0) { throw "Runtime wheel import smoke test failed" }
 
           $RuntimeBase64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($RuntimeLock))
