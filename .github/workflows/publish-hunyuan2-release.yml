@@ -1,0 +1,298 @@
+name: Publish fixed Hunyuan3D updater
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: mujassam-hunyuan3d-fixed-release-v1
+  cancel-in-progress: false
+
+jobs:
+  publish-updater:
+    name: Split, verify, and publish resumable updater
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      SOURCE_RUN_ID: "33030801098"
+      SOURCE_ARTIFACT: MujassamAI-Hunyuan-Update-v1
+      ARCHIVE_NAME: MujassamAI-Hunyuan-Update-v1.zip
+      RELEASE_TAG: hunyuan3d-8gb-v1
+      RELEASE_MANIFEST: hunyuan-update-release-manifest.json
+      UPDATER_NAME: HunyuanUpdateSetup.exe
+      PART_BYTES: "50331648"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download and validate the successful pinned artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Stage = Join-Path $env:RUNNER_TEMP "hunyuan-release-stage"
+          New-Item -ItemType Directory -Path $Stage | Out-Null
+
+          $Run = gh api "repos/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:SOURCE_RUN_ID)" |
+              ConvertFrom-Json
+          if ($Run.status -ne "completed" -or $Run.conclusion -ne "success" -or
+              $Run.event -ne "workflow_dispatch" -or
+              $Run.head_repository.full_name -ne $env:GITHUB_REPOSITORY -or
+              -not ([string]$Run.path).EndsWith(".github/workflows/hunyuan2-8gb-update.yml")) {
+              throw "Pinned run is not the expected successful manual Hunyuan build"
+          }
+
+          gh run download $env:SOURCE_RUN_ID `
+              --repo $env:GITHUB_REPOSITORY `
+              --name $env:SOURCE_ARTIFACT `
+              --dir $Stage
+
+          $ManifestPath = Join-Path $Stage "update-manifest.json"
+          if (-not (Test-Path $ManifestPath -PathType Leaf)) {
+              throw "Pinned artifact is missing update-manifest.json"
+          }
+          $Payload = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+          if ($Payload.schema_version -ne 1 -or
+              $Payload.archive -ne $env:ARCHIVE_NAME -or
+              $Payload.source_commit -ne $Run.head_sha -or
+              @($Payload.files).Count -eq 0) {
+              throw "Pinned artifact manifest metadata is invalid"
+          }
+
+          $Expected = [Collections.Generic.HashSet[string]]::new(
+              [StringComparer]::OrdinalIgnoreCase)
+          foreach ($Entry in $Payload.files) {
+              $Relative = [string]$Entry.path
+              if ($Relative -notmatch '^[A-Za-z0-9_. /+()-]+$' -or
+                  $Relative -match '(^|/)\.\.(/|$)' -or
+                  -not $Expected.Add($Relative)) {
+                  throw "Unsafe or duplicate payload path: $Relative"
+              }
+              $Native = $Relative.Replace([char]'/', [IO.Path]::DirectorySeparatorChar)
+              $File = Get-Item (Join-Path $Stage $Native)
+              $Digest = (Get-FileHash $File.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($File.Length -ne [Int64]$Entry.bytes -or
+                  $Digest -cne [string]$Entry.sha256) {
+                  throw "Payload verification failed: $Relative"
+              }
+          }
+          foreach ($Required in @(
+              "MujassamAI.exe",
+              "app/worker.py",
+              "app/engines/hunyuan2/hunyuan2_worker.py",
+              "app/engines/hunyuan2/ENGINE-MANIFEST.json"
+          )) {
+              if (-not $Expected.Contains($Required)) {
+                  throw "Pinned artifact is missing $Required"
+              }
+          }
+          $Actual = @(Get-ChildItem $Stage -Recurse -File | ForEach-Object {
+              $_.FullName.Substring($Stage.Length).TrimStart(
+                  [IO.Path]::DirectorySeparatorChar).Replace(
+                  [IO.Path]::DirectorySeparatorChar, [char]'/')
+          } | Where-Object { $_ -ne "update-manifest.json" })
+          if ($Actual.Count -ne $Expected.Count -or
+              @($Actual | Where-Object { -not $Expected.Contains($_) }).Count -ne 0) {
+              throw "Artifact contains files not covered by update-manifest.json"
+          }
+          "HY_STAGE=$Stage" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "HY_SOURCE_SHA=$($Run.head_sha)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create verified ZIP and 48 MiB release parts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Output = Join-Path $env:RUNNER_TEMP "hunyuan-release-output"
+          $Verify = Join-Path $env:RUNNER_TEMP "hunyuan-release-verify"
+          New-Item -ItemType Directory -Path $Output, $Verify | Out-Null
+          $Archive = Join-Path $Output $env:ARCHIVE_NAME
+          Compress-Archive -Path (Join-Path $env:HY_STAGE "*") `
+              -DestinationPath $Archive -CompressionLevel Optimal
+
+          Expand-Archive -Path $Archive -DestinationPath $Verify
+          $Payload = Get-Content (Join-Path $Verify "update-manifest.json") -Raw |
+              ConvertFrom-Json
+          foreach ($Entry in $Payload.files) {
+              $Native = ([string]$Entry.path).Replace(
+                  [char]'/', [IO.Path]::DirectorySeparatorChar)
+              $File = Get-Item (Join-Path $Verify $Native)
+              if ($File.Length -ne [Int64]$Entry.bytes -or
+                  (Get-FileHash $File.FullName -Algorithm SHA256).Hash.ToLowerInvariant() `
+                      -cne [string]$Entry.sha256) {
+                  throw "Clean ZIP verification failed: $($Entry.path)"
+              }
+          }
+
+          $ArchiveFile = Get-Item $Archive
+          $ArchiveHash = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $Parts = [Collections.Generic.List[object]]::new()
+          $Buffer = New-Object byte[] ([Int32]$env:PART_BYTES)
+          $Input = [IO.File]::OpenRead($Archive)
+          try {
+              $Index = 1
+              while (($Read = $Input.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+                  $Name = "$($env:ARCHIVE_NAME).part$($Index.ToString('D3'))"
+                  $Path = Join-Path $Output $Name
+                  $Part = [IO.File]::Open($Path, [IO.FileMode]::CreateNew,
+                      [IO.FileAccess]::Write, [IO.FileShare]::None)
+                  try { $Part.Write($Buffer, 0, $Read); $Part.Flush($true) }
+                  finally { $Part.Dispose() }
+                  $Parts.Add([ordered]@{
+                      name = $Name
+                      bytes = [Int64]$Read
+                      sha256 = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+                  })
+                  $Index++
+              }
+          }
+          finally { $Input.Dispose() }
+          if ($Parts.Count -lt 2 -or
+              ($Parts | Measure-Object bytes -Sum).Sum -ne $ArchiveFile.Length) {
+              throw "ZIP splitting failed"
+          }
+
+          $ReleaseManifestObject = [ordered]@{
+              schema_version = 1
+              release_tag = $env:RELEASE_TAG
+              source_run_id = [Int64]$env:SOURCE_RUN_ID
+              source_commit = $env:HY_SOURCE_SHA
+              archive = [ordered]@{
+                  file_name = $env:ARCHIVE_NAME
+                  bytes = [Int64]$ArchiveFile.Length
+                  sha256 = $ArchiveHash
+                  parts = $Parts
+              }
+          }
+          $ManifestPath = Join-Path $Output $env:RELEASE_MANIFEST
+          $Json = $ReleaseManifestObject | ConvertTo-Json -Depth 8
+          [IO.File]::WriteAllText($ManifestPath, $Json, [Text.UTF8Encoding]::new($false))
+          $ManifestHash = (Get-FileHash $ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "HY_OUTPUT=$Output" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "HY_MANIFEST_SHA256=$ManifestHash" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "HY_ARCHIVE_SHA256=$ArchiveHash" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Compile and self-test the resumable updater
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Work = Join-Path $env:RUNNER_TEMP "hunyuan-updater-build"
+          New-Item -ItemType Directory -Path $Work | Out-Null
+          $Source = Get-Content installer/HunyuanUpdateSetup.cs -Raw
+          $ReleaseBase = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$($env:RELEASE_TAG)"
+          $Replacements = [ordered]@{
+              "@@RELEASE_BASE_URL@@" = $ReleaseBase
+              "@@GITHUB_REPOSITORY@@" = $env:GITHUB_REPOSITORY
+              "@@RELEASE_TAG@@" = $env:RELEASE_TAG
+              "@@MANIFEST_SHA256@@" = $env:HY_MANIFEST_SHA256
+          }
+          foreach ($Pair in $Replacements.GetEnumerator()) {
+              if (-not $Source.Contains($Pair.Key)) { throw "Missing source marker $($Pair.Key)" }
+              $Source = $Source.Replace($Pair.Key, $Pair.Value)
+          }
+          if ($Source.Contains("@@")) { throw "Updater contains an unresolved marker" }
+          $Patched = Join-Path $Work "HunyuanUpdateSetup.cs"
+          [IO.File]::WriteAllText($Patched, $Source, [Text.UTF8Encoding]::new($false))
+
+          $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $VsInstall = & $VsWhere -latest -products * -requires Microsoft.Component.MSBuild `
+              -property installationPath
+          $Csc = Join-Path $VsInstall "MSBuild\Current\Bin\Roslyn\csc.exe"
+          $Refs = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8"
+          $AppManifest = Join-Path $Work "updater.manifest"
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+            <assemblyIdentity version="1.0.0.0" name="MujassamAI.HunyuanUpdater" />
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
+              <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+            </requestedPrivileges></security></trustInfo>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>
+              <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+            </windowsSettings></application>
+          </assembly>
+          '@ | Set-Content $AppManifest -Encoding utf8
+          $ReferenceNames = @(
+              "System.dll", "System.Core.dll", "System.Drawing.dll",
+              "System.Windows.Forms.dll", "System.Web.Extensions.dll",
+              "System.IO.Compression.dll", "System.IO.Compression.FileSystem.dll"
+          )
+          $ReferenceArgs = @($ReferenceNames | ForEach-Object { "/reference:$(Join-Path $Refs $_)" })
+          $Updater = Join-Path $env:HY_OUTPUT $env:UPDATER_NAME
+          & $Csc /nologo /noconfig /target:winexe /platform:x64 /optimize+ /debug- `
+              /langversion:latest "/win32manifest:$AppManifest" "/out:$Updater" `
+              @ReferenceArgs $Patched
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Updater -PathType Leaf)) {
+              throw "Updater compilation failed"
+          }
+          $Report = Join-Path $Work "self-test.txt"
+          $Process = Start-Process $Updater -ArgumentList @("--self-test", $Report) `
+              -Wait -PassThru
+          if ($Process.ExitCode -ne 0 -or -not (Test-Path $Report)) {
+              throw "Updater self-test failed: $($Process.ExitCode)"
+          }
+          $Text = Get-Content $Report -Raw
+          if (-not $Text.Contains("ReleaseBase=$ReleaseBase/") -or
+              -not $Text.Contains("ReleaseTag=$($env:RELEASE_TAG)") -or
+              -not $Text.Contains("ManifestSHA256=$($env:HY_MANIFEST_SHA256)")) {
+              throw "Updater self-test reported incorrect pinned values"
+          }
+
+      - name: Publish permanent GitHub Release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          $Exists = $LASTEXITCODE -eq 0
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not $Exists) {
+              gh release create $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+                  --target $env:GITHUB_SHA `
+                  --title "Mujassam AI — Hunyuan3D 8GB updater" `
+                  --notes "Run HunyuanUpdateSetup.exe. Downloads resume automatically and every part is SHA-256 verified. Source workflow run: $env:SOURCE_RUN_ID."
+          }
+
+          $Assets = @(
+              (Join-Path $env:HY_OUTPUT $env:RELEASE_MANIFEST)
+          ) + @(Get-ChildItem $env:HY_OUTPUT -Filter "$($env:ARCHIVE_NAME).part*" |
+              Sort-Object Name | ForEach-Object FullName)
+          # Upload the pinned manifest and parts first. The executable is last,
+          # so users can never receive a new updater before all of its inputs exist.
+          foreach ($Asset in $Assets) {
+              gh release upload $env:RELEASE_TAG $Asset `
+                  --repo $env:GITHUB_REPOSITORY --clobber
+          }
+          gh release upload $env:RELEASE_TAG `
+              (Join-Path $env:HY_OUTPUT $env:UPDATER_NAME) `
+              --repo $env:GITHUB_REPOSITORY --clobber
+
+          $Release = gh api "repos/$($env:GITHUB_REPOSITORY)/releases/tags/$($env:RELEASE_TAG)" |
+              ConvertFrom-Json
+          $ExpectedNames = @($Assets | ForEach-Object { Split-Path $_ -Leaf }) + @($env:UPDATER_NAME)
+          foreach ($Name in $ExpectedNames) {
+              $Matches = @($Release.assets | Where-Object name -eq $Name)
+              if ($Matches.Count -ne 1 -or $Matches[0].size -le 0) {
+                  throw "Published release is missing or duplicated: $Name"
+              }
+          }
+          $ManifestAsset = @($Release.assets | Where-Object name -eq $env:RELEASE_MANIFEST)[0]
+          if ($ManifestAsset.digest -and
+              $ManifestAsset.digest -ne "sha256:$($env:HY_MANIFEST_SHA256)") {
+              throw "Published release manifest digest mismatch"
+          }
+          @"
+          ## Permanent Hunyuan3D updater published
+
+          Download **HunyuanUpdateSetup.exe** from:
+          $($Release.html_url)
+
+          - Source run: ``$env:SOURCE_RUN_ID``
+          - Parts: ``$(@($Assets).Count - 1)`` × at most 48 MiB
+          - ZIP SHA-256: ``$env:HY_ARCHIVE_SHA256``
+          - Resume, retry, per-part SHA-256, safe extraction, and rollback are enabled.
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
