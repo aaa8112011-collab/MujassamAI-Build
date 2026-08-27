@@ -40,6 +40,18 @@ function Assert-NativeCommand([string]$Name) {
     return $Command.Source
 }
 
+function Get-CanonicalUtf8TextSha256([string]$Path) {
+    $Utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $Text = [IO.File]::ReadAllText($Path, $Utf8)
+    $CanonicalText = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    if ($CanonicalText.Contains([char]0)) {
+        throw "ملف النص القانوني يحتوي NUL غير صالح: $Path"
+    }
+    $Bytes = $Utf8.GetBytes($CanonicalText)
+    $Digest = [Security.Cryptography.SHA256]::HashData($Bytes)
+    return [Convert]::ToHexString($Digest).ToLowerInvariant()
+}
+
 function Assert-SafeOwnedTemporaryDirectory([string]$Path) {
     $FullPath = [IO.Path]::GetFullPath($Path)
     $TemporaryRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd(
@@ -179,8 +191,7 @@ if ([string]$EngineManifest.source.commit -cne $PinnedSourceCommit -or
     [string]$EngineManifest.source.license_file_sha256 -cne $ExpectedLicenseSha256) {
     throw "ENGINE-MANIFEST لا يطابق مصدر/ترخيص Hunyuan3D 2.1 المثبت."
 }
-$ActualLicenseSha256 = (Get-FileHash -LiteralPath $LicensePath `
-    -Algorithm SHA256).Hash.ToLowerInvariant()
+$ActualLicenseSha256 = Get-CanonicalUtf8TextSha256 $LicensePath
 if ($ActualLicenseSha256 -cne $ExpectedLicenseSha256) {
     throw "بصمة ملف ترخيص Hunyuan3D 2.1 غير صحيحة."
 }
