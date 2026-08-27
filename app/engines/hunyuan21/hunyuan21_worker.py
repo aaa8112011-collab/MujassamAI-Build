@@ -1571,7 +1571,11 @@ def _force_weights_only_torch_load(
 
     def restricted_load(*args: Any, **kwargs: Any) -> Any:
         source = args[0] if args else kwargs.get("f")
-        if hasattr(source, "name"):
+        # pathlib.Path also has a ``name`` attribute, but it is only the final
+        # component.  Preserve path-like inputs so relative resolution cannot
+        # silently discard their verified parent directory.  Only unwrap the
+        # ``name`` of an actual file-like object.
+        if not isinstance(source, (str, os.PathLike)) and hasattr(source, "name"):
             source = source.name
         if not isinstance(source, (str, os.PathLike)):
             raise RuntimeError("torch.load source is not an allowlisted checkpoint path")
@@ -2101,7 +2105,9 @@ def _weights_only_guard_self_test() -> bool:
         _force_weights_only_torch_load(
             probe, {own_path: (own_path.stat().st_size, _sha256(own_path))}
         )
-        result = probe.load(str(own_path))
+        # Keep this as a Path object: pathlib.Path.name must never be mistaken
+        # for the name of an already-open file handle.
+        result = probe.load(own_path)
         if (
             result.get("weights_only") is not True
             or not hasattr(probe.source, "read")
