@@ -1,0 +1,460 @@
+name: Validate Hunyuan3D 2.1 PBR updater
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_build:
+        description: Run full build only after adding the complete hashed Windows dependency lock
+        required: true
+        default: false
+        type: boolean
+      license_accepted:
+        description: I accept the Tencent Hunyuan 3D 2.1 Community License for this build
+        required: true
+        default: false
+        type: boolean
+      territory_confirmed:
+        description: The self-hosted runner and operator are outside the EU, UK, and South Korea
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mujassam-hunyuan3d-21-pbr-v1
+  cancel-in-progress: false
+
+jobs:
+  adapter-static-validation:
+    name: Adapter-only model-free validation
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Mujassam AI adapter source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Select CPython 3.11.9
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11.9"
+          architecture: x64
+
+      - name: Validate repository-owned adapter without Tencent source or weights
+        shell: pwsh
+        run: |
+          python -m py_compile `
+            app/worker.py `
+            app/engines/hunyuan21/hunyuan21_worker.py `
+            build/patch_hunyuan21_windows.py `
+            build/validate_hunyuan21_adapter.py
+          if ($LASTEXITCODE -ne 0) { throw "Python compilation failed" }
+          python build/validate_hunyuan21_adapter.py
+          if ($LASTEXITCODE -ne 0) { throw "Adapter static validation failed" }
+          python app/worker.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Base worker self-test failed" }
+
+      - name: Compile the repository-owned WinForms adapter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Work = Join-Path $env:RUNNER_TEMP "hunyuan21-adapter-csharp"
+          New-Item -ItemType Directory -Path $Work | Out-Null
+          $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $VsInstall = & $VsWhere -latest -products * -requires Microsoft.Component.MSBuild `
+              -property installationPath | Select-Object -First 1
+          if (-not $VsInstall) { throw "Visual Studio MSBuild was not found" }
+          $Csc = Join-Path $VsInstall "MSBuild\Current\Bin\Roslyn\csc.exe"
+          $Refs = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8"
+          $ReferenceNames = @(
+            "System.dll", "System.Core.dll", "System.Drawing.dll",
+            "System.Windows.Forms.dll", "System.Web.Extensions.dll"
+          )
+          $ReferenceArgs = @($ReferenceNames | ForEach-Object {
+            $Path = Join-Path $Refs $_
+            if (-not (Test-Path $Path -PathType Leaf)) {
+              throw "Missing .NET Framework reference: $Path"
+            }
+            "/reference:$Path"
+          })
+          $Executable = Join-Path $Work "MujassamAI-adapter-check.exe"
+          & $Csc /nologo /noconfig /target:winexe /platform:x64 /optimize+ /debug- `
+              /langversion:latest "/out:$Executable" @ReferenceArgs `
+              app/Program.cs app/MainForm.cs
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Executable -PathType Leaf)) {
+            throw "WinForms adapter compilation failed"
+          }
+
+  build-and-package:
+    name: Territory-approved local full-build validation (no Actions distribution)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.full_build && inputs.license_accepted && inputs.territory_confirmed
+    needs: adapter-static-validation
+    runs-on: [self-hosted, Windows, X64, hy21-territory]
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    env:
+      ARCHIVE_NAME: MujassamAI-Hunyuan21-PBR-Update-v1.zip
+      RELEASE_TAG: hunyuan3d-2.1-pbr-v1
+      RELEASE_MANIFEST: hunyuan21-update-release-manifest.json
+      UPDATER_NAME: Hunyuan21UpdateSetup.exe
+      PART_BYTES: "50331648"
+      # Tencent source may not be published through a globally accessible
+      # GitHub artifact/Release. It remains local to this approved runner.
+      MUJASSAM_PROVIDER_LEGAL_NAME: CI validation build — Hunyuan3D 2.1 disabled
+      # Fail before source fetch or pip execution until every Windows runtime
+      # dependency and transitive wheel has an approved SHA-256 lock entry.
+      MUJASSAM_REQUIRE_HASHED_DEPENDENCIES: "1"
+      MUJASSAM_HY21_LICENSE_ACCEPTED: ${{ inputs.license_accepted && '1' || '0' }}
+      MUJASSAM_HY21_TERRITORY_CONFIRMED: ${{ inputs.territory_confirmed && '1' || '0' }}
+
+    steps:
+      - name: Checkout Mujassam AI source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Select CPython 3.11.9
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11.9"
+          architecture: x64
+
+      - name: Build and verify the Hunyuan3D 2.1 Windows update
+        shell: pwsh
+        run: ./build/build-hunyuan21-update.ps1
+
+      - name: Create verified 48 MiB local test parts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Archive = Get-Item -LiteralPath $env:MUJASSAM_HUNYUAN21_ARCHIVE
+          $StageManifest = Get-Content `
+              (Join-Path $env:MUJASSAM_HUNYUAN21_STAGE "update-manifest.json") -Raw |
+              ConvertFrom-Json
+          if ($StageManifest.schema_version -ne 1 -or
+              $StageManifest.archive -ne $env:ARCHIVE_NAME -or
+              $StageManifest.source_commit -ne $env:GITHUB_SHA -or
+              $StageManifest.provider_legal_name -ne $env:MUJASSAM_PROVIDER_LEGAL_NAME -or
+              @($StageManifest.files).Count -eq 0) {
+            throw "Built update manifest metadata is invalid"
+          }
+
+          $Output = Join-Path $env:RUNNER_TEMP "hunyuan21-release-output"
+          New-Item -ItemType Directory -Path $Output | Out-Null
+          $ArchiveHash = (Get-FileHash $Archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $Parts = [Collections.Generic.List[object]]::new()
+          $Buffer = New-Object byte[] ([Int32]$env:PART_BYTES)
+          $SplitBytes = [Int64]0
+          $Input = [IO.File]::OpenRead($Archive.FullName)
+          try {
+            $Index = 1
+            while (($Read = $Input.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+              $Name = "$($env:ARCHIVE_NAME).part$($Index.ToString('D3'))"
+              $Path = Join-Path $Output $Name
+              $Part = [IO.File]::Open($Path, [IO.FileMode]::CreateNew,
+                  [IO.FileAccess]::Write, [IO.FileShare]::None)
+              try { $Part.Write($Buffer, 0, $Read); $Part.Flush($true) }
+              finally { $Part.Dispose() }
+              $Parts.Add([ordered]@{
+                name = $Name
+                bytes = [Int64]$Read
+                sha256 = (Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+              })
+              $SplitBytes += [Int64]$Read
+              $Index++
+            }
+          }
+          finally { $Input.Dispose() }
+          if ($Parts.Count -lt 1 -or $SplitBytes -ne [Int64]$Archive.Length) {
+            throw "ZIP splitting failed"
+          }
+
+          $ReleaseManifestObject = [ordered]@{
+            schema_version = 1
+            release_tag = $env:RELEASE_TAG
+            source_run_id = [Int64]$env:GITHUB_RUN_ID
+            source_commit = $env:GITHUB_SHA
+            provider_legal_name = $env:MUJASSAM_PROVIDER_LEGAL_NAME
+            archive = [ordered]@{
+              file_name = $env:ARCHIVE_NAME
+              bytes = [Int64]$Archive.Length
+              sha256 = $ArchiveHash
+              parts = $Parts
+            }
+          }
+          $ManifestPath = Join-Path $Output $env:RELEASE_MANIFEST
+          $Json = $ReleaseManifestObject | ConvertTo-Json -Depth 8
+          [IO.File]::WriteAllText(
+              $ManifestPath, $Json, [Text.UTF8Encoding]::new($false))
+          $ManifestHash = (Get-FileHash $ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "HY21_OUTPUT=$Output" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "HY21_MANIFEST_SHA256=$ManifestHash" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "HY21_ARCHIVE_SHA256=$ArchiveHash" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "HY21_PART_COUNT=$($Parts.Count)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Compile and self-test the resumable updater
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Work = Join-Path $env:RUNNER_TEMP "hunyuan21-updater-build"
+          New-Item -ItemType Directory -Path $Work | Out-Null
+          $Source = Get-Content installer/HunyuanUpdateSetup.cs -Raw
+          if ($env:RELEASE_MANIFEST -notmatch '^[A-Za-z0-9_.-]+\.json$' -or
+              $env:ARCHIVE_NAME -notmatch '^[A-Za-z0-9_.-]+\.zip$' -or
+              $env:GITHUB_RUN_ID -notmatch '^[1-9][0-9]*$') {
+            throw "Unsafe updater build metadata"
+          }
+          $ReleaseBase = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$($env:RELEASE_TAG)"
+          $Replacements = [ordered]@{
+            "@@RELEASE_BASE_URL@@" = $ReleaseBase
+            "@@GITHUB_REPOSITORY@@" = $env:GITHUB_REPOSITORY
+            "@@RELEASE_TAG@@" = $env:RELEASE_TAG
+            "@@MANIFEST_SHA256@@" = $env:HY21_MANIFEST_SHA256
+          }
+          foreach ($Pair in $Replacements.GetEnumerator()) {
+            $Count = [regex]::Matches(
+                $Source, [regex]::Escape([string]$Pair.Key)).Count
+            if ($Count -ne 1) {
+              throw "Expected one updater source marker $($Pair.Key), found $Count"
+            }
+            $Source = $Source.Replace($Pair.Key, $Pair.Value)
+          }
+
+          $OldManifestName = 'hunyuan-update-release-manifest.json'
+          $ManifestNameCount = [regex]::Matches(
+              $Source, [regex]::Escape($OldManifestName)).Count
+          if ($ManifestNameCount -ne 1) {
+            throw "Unexpected updater manifest-name contract: $ManifestNameCount"
+          }
+          $Source = $Source.Replace($OldManifestName, $env:RELEASE_MANIFEST)
+
+          $OldRunContract = 'wire.source_run_id != 33030801098L'
+          $RunContractCount = [regex]::Matches(
+              $Source, [regex]::Escape($OldRunContract)).Count
+          if ($RunContractCount -ne 1) {
+            throw "Unexpected updater source-run contract: $RunContractCount"
+          }
+          $Source = $Source.Replace(
+              $OldRunContract,
+              "wire.source_run_id != $($env:GITHUB_RUN_ID)L")
+
+          $OldRequiredPattern = (
+            '"MujassamAI\.exe",\s*"app/worker\.py",\s*' +
+            '"app/engines/hunyuan2/hunyuan2_worker\.py",\s*' +
+            '"app/engines/hunyuan2/ENGINE-MANIFEST\.json"'
+          )
+          $RequiredCount = [regex]::Matches(
+              $Source, $OldRequiredPattern,
+              [Text.RegularExpressions.RegexOptions]::CultureInvariant).Count
+          if ($RequiredCount -ne 1) {
+            throw "Unexpected updater required-payload contract: $RequiredCount"
+          }
+          $NewRequired = @'
+          "MujassamAI.exe", "NOTICE_THIRD_PARTY.md", "app/worker.py",
+                              "app/engines/hunyuan21/hunyuan21_worker.py",
+                              "app/engines/hunyuan21/ENGINE-MANIFEST.json",
+                              "app/engines/hunyuan21/LICENSE-HUNYUAN3D-2.1.txt",
+                              "app/engines/hunyuan21/NOTICE.txt"
+          '@
+          $Source = [regex]::Replace(
+              $Source, $OldRequiredPattern, $NewRequired,
+              [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+
+          # The generic Hunyuan2 updater accepts a very small base layout.
+          # This generated H21 updater additionally requires the exact portable
+          # ABI and assets that H21 reuses; the generic source remains unchanged.
+          $OldBaseRequiredPattern = (
+            '"MujassamAI\.exe",\s*Path\.Combine\("rt", "python\.exe"\),\s*' +
+            'Path\.Combine\("app", "worker\.py"\)'
+          )
+          $BaseRequiredCount = [regex]::Matches(
+              $Source, $OldBaseRequiredPattern,
+              [Text.RegularExpressions.RegexOptions]::CultureInvariant).Count
+          if ($BaseRequiredCount -ne 1) {
+            throw "Unexpected updater base-layout contract: $BaseRequiredCount"
+          }
+          $NewBaseRequired = @'
+          "MujassamAI.exe",
+                          Path.Combine("rt", "python.exe"),
+                          Path.Combine("app", "worker.py"),
+                          "VERSION.txt",
+                          "BUILD-MANIFEST.txt",
+                          "MODEL-MANIFEST.json",
+                          Path.Combine("app", "quality", "__init__.py"),
+                          Path.Combine("app", "quality", "models.json"),
+                          Path.Combine("app", "quality", "realesrgan_x2.py"),
+                          Path.Combine("models", "realesrgan", "RealESRGAN_x2plus.pth"),
+                          Path.Combine("models", "transparent-background", "ckpt_base.pth"),
+                          Path.Combine("models", "spar3d", "config.yaml"),
+                          Path.Combine("models", "spar3d", "model.safetensors"),
+                          Path.Combine("app", "vendor", "stable-point-aware-3d", "spar3d", "system.py"),
+                          Path.Combine("app", "vendor", "stable-point-aware-3d", "spar3d", "utils.py"),
+                          Path.Combine("app", "vendor", "stable-point-aware-3d", "run.py")
+          '@
+          $Source = [regex]::Replace(
+              $Source, $OldBaseRequiredPattern, $NewBaseRequired,
+              [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+
+          $BaseLoopPattern = (
+            'foreach \(string relative in required\)\s*\{\s*' +
+            'string path = Path\.Combine\(root, relative\);\s*' +
+            'if \(!File\.Exists\(path\) \|\| new FileInfo\(path\)\.Length <= 0\)\s*' +
+            'throw new UpdateException\("التثبيت الأصلي ناقص: " \+ relative\);\s*\}'
+          )
+          $BaseLoopMatches = [regex]::Matches(
+              $Source, $BaseLoopPattern,
+              [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+          if ($BaseLoopMatches.Count -ne 1) {
+            throw "Unexpected updater base-validation loop: $($BaseLoopMatches.Count)"
+          }
+          $BasePreflight = @'
+          string versionText = File.ReadAllText(Path.Combine(root, "VERSION.txt"), Encoding.UTF8);
+                      string[] versionPins = new string[]
+                      {
+                          "Python: 3.11.9 application-local x64",
+                          "PyTorch: 2.5.1+cu124",
+                          "TorchVision: 0.20.1+cu124"
+                      };
+                      foreach (string pin in versionPins)
+                          if (versionText.IndexOf(pin, StringComparison.Ordinal) < 0)
+                              throw new UpdateException("إصدار MujassamAI-Portable الأساسي غير متوافق: " + pin);
+
+                      string abiCode =
+                          "import importlib.metadata as m,struct,sys,torch;" +
+                          "tv=m.version('torchvision');" +
+                          "ok=(sys.version_info[:3]==(3,11,9) and struct.calcsize('P')==8 and " +
+                          "torch.__version__=='2.5.1+cu124' and tv=='0.20.1+cu124');" +
+                          "print('MJABI|'+sys.version.split()[0]+'|'+torch.__version__+'|'+tv);" +
+                          "sys.exit(0 if ok else 23)";
+                      ProcessStartInfo abiInfo = new ProcessStartInfo
+                      {
+                          FileName = Path.Combine(root, "rt", "python.exe"),
+                          Arguments = "-I -X utf8 -c \"" + abiCode + "\"",
+                          WorkingDirectory = root,
+                          UseShellExecute = false,
+                          CreateNoWindow = true,
+                          RedirectStandardOutput = true,
+                          RedirectStandardError = true
+                      };
+                      using (Process abiProcess = new Process { StartInfo = abiInfo })
+                      {
+                          if (!abiProcess.Start())
+                              throw new UpdateException("تعذر تشغيل فحص Python الأساسي.");
+                          if (!abiProcess.WaitForExit(60000))
+                          {
+                              try { abiProcess.Kill(); } catch { }
+                              throw new UpdateException("انتهت مهلة فحص Python الأساسي.");
+                          }
+                          string output = abiProcess.StandardOutput.ReadToEnd().Trim();
+                          string error = abiProcess.StandardError.ReadToEnd().Trim();
+                          string expected = "MJABI|3.11.9|2.5.1+cu124|0.20.1+cu124";
+                          if (abiProcess.ExitCode != 0 || output.IndexOf(expected,
+                              StringComparison.Ordinal) < 0)
+                          {
+                              string detail = (output + " " + error).Trim();
+                              if (detail.Length > 500) detail = detail.Substring(0, 500);
+                              throw new UpdateException("Python/PyTorch الأساسي غير متوافق: " + detail);
+                          }
+                      }
+          '@
+          $BaseLoop = $BaseLoopMatches[0]
+          $BaseLoopReplacement = $BaseLoop.Value + [Environment]::NewLine + $BasePreflight
+          $Source = $Source.Remove($BaseLoop.Index, $BaseLoop.Length).Insert(
+              $BaseLoop.Index, $BaseLoopReplacement)
+
+          $OldArchive = "MujassamAI-Hunyuan-Update-v1.zip"
+          if ([regex]::Matches($Source, [regex]::Escape($OldArchive)).Count -ne 2) {
+            throw "Unexpected updater archive-name contract"
+          }
+          $Source = $Source.Replace($OldArchive, $env:ARCHIVE_NAME)
+          $OldTitle = "تحديث Hunyuan3D لجهاز 8GB VRAM"
+          $TitleCount = [regex]::Matches(
+              $Source, [regex]::Escape($OldTitle)).Count
+          if ($TitleCount -ne 1) {
+            throw "Unexpected updater title contract: $TitleCount"
+          }
+          $Source = $Source.Replace($OldTitle, "تحديث Hunyuan3D 2.1 بخامات PBR")
+          $SelfTestMarker = '                report.AppendLine("ManifestSHA256=" + UpdaterConfiguration.GetManifestSha256());'
+          $SelfTestMarkerCount = [regex]::Matches(
+              $Source, [regex]::Escape($SelfTestMarker)).Count
+          if ($SelfTestMarkerCount -ne 1) {
+            throw "Unexpected updater self-test contract: $SelfTestMarkerCount"
+          }
+          $SelfTestLines = $SelfTestMarker + [Environment]::NewLine +
+              '                report.AppendLine("ManifestAsset=" + UpdaterConfiguration.ManifestAssetName);' +
+              [Environment]::NewLine +
+              "                report.AppendLine(`"SourceRunId=$($env:GITHUB_RUN_ID)`");"
+          $Source = $Source.Replace($SelfTestMarker, $SelfTestLines)
+          foreach ($Forbidden in @(
+              $OldManifestName, $OldRunContract,
+              "app/engines/hunyuan2/hunyuan2_worker.py",
+              "app/engines/hunyuan2/ENGINE-MANIFEST.json"
+          )) {
+            if ($Source.Contains($Forbidden)) {
+              throw "Updater still contains obsolete contract: $Forbidden"
+            }
+          }
+          $Unresolved = @(
+            [regex]::Matches($Source, '@@[A-Z][A-Z0-9_]*@@') |
+              ForEach-Object Value | Sort-Object -Unique
+          )
+          if ($Unresolved.Count -gt 0) {
+            throw "Updater contains unresolved marker(s): $($Unresolved -join ', ')"
+          }
+          $Patched = Join-Path $Work "HunyuanUpdateSetup.cs"
+          [IO.File]::WriteAllText($Patched, $Source, [Text.UTF8Encoding]::new($false))
+
+          $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $VsInstall = & $VsWhere -latest -products * -requires Microsoft.Component.MSBuild `
+              -property installationPath | Select-Object -First 1
+          $Csc = Join-Path $VsInstall "MSBuild\Current\Bin\Roslyn\csc.exe"
+          $Refs = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8"
+          $AppManifest = Join-Path $Work "updater.manifest"
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+            <assemblyIdentity version="1.0.0.0" name="MujassamAI.Hunyuan21Updater" />
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
+              <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+            </requestedPrivileges></security></trustInfo>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>
+              <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+            </windowsSettings></application>
+          </assembly>
+          '@ | Set-Content $AppManifest -Encoding utf8
+          $ReferenceNames = @(
+            "System.dll", "System.Core.dll", "System.Drawing.dll",
+            "System.Windows.Forms.dll", "System.Web.Extensions.dll",
+            "System.IO.Compression.dll", "System.IO.Compression.FileSystem.dll"
+          )
+          $ReferenceArgs = @($ReferenceNames | ForEach-Object {
+            "/reference:$(Join-Path $Refs $_)"
+          })
+          $Updater = Join-Path $env:HY21_OUTPUT $env:UPDATER_NAME
+          & $Csc /nologo /noconfig /target:winexe /platform:x64 /optimize+ /debug- `
+              /langversion:latest "/win32manifest:$AppManifest" "/out:$Updater" `
+              @ReferenceArgs $Patched
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Updater -PathType Leaf)) {
+            throw "Updater compilation failed"
+          }
+          $Report = Join-Path $Work "self-test.txt"
+          $Process = Start-Process $Updater -ArgumentList @("--self-test", $Report) `
+              -Wait -PassThru
+          if ($Process.ExitCode -ne 0 -or -not (Test-Path $Report)) {
+            throw "Updater self-test failed: $($Process.ExitCode)"
+          }
+          $Text = Get-Content $Report -Raw
+          if (-not $Text.Contains("ReleaseBase=$ReleaseBase/") -or
+              -not $Text.Contains("ReleaseTag=$($env:RELEASE_TAG)") -or
+              -not $Text.Contains("ManifestSHA256=$($env:HY21_MANIFEST_SHA256)") -or
+              -not $Text.Contains("ManifestAsset=$($env:RELEASE_MANIFEST)") -or
+              -not $Text.Contains("SourceRunId=$($env:GITHUB_RUN_ID)")) {
+            throw "Updater self-test reported incorrect pinned values"
+          }

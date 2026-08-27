@@ -1,0 +1,58 @@
+Mujassam AI integration notice for Hunyuan3D 2.1
+
+The Mujassam AI repository contains an independent adapter for the official
+Tencent Hunyuan3D-2.1 inference project pinned to source commit
+82920d643c0dc2f7bfd7255f45f62d386edfe60c. Tencent source code and model
+weights are not committed to this repository. Eligible users obtain them from
+Tencent's official repositories at the immutable revisions recorded in
+ENGINE-MANIFEST.json after separately accepting the applicable license and
+Acceptable Use Policy.
+
+When an eligible build or installation materializes the upstream inference
+source, Mujassam AI changes it only as needed for the following integration:
+
+* application-local Windows paths and a portable Python runtime;
+* separate shape and PBR-paint processes with explicit CUDA cleanup;
+* deterministic model-cache locations and immutable model revisions;
+* exact byte-count and SHA-256 verification before any checkpoint is loaded;
+* byte-for-byte allowlisting before checkpoint deserialization, with
+  weights-only PyTorch loading as defense in depth rather than the trust
+  boundary, and no downloaded model Python code;
+* Windows builds of the official custom rasterizer and differentiable renderer;
+* staged progress/error reporting to the Mujassam AI desktop interface;
+* preservation of the high-detail mesh by disabling Paint's optional remesh;
+* export of albedo and metallic-roughness PBR material data in the final GLB;
+* quality profiles for 512/768 multiview PBR generation and a resumable model
+  download flow.
+
+Every upstream file changed by the build must retain its original notice and
+carry a prominent "Modified by Mujassam AI" header. The complete current
+Tencent license and upstream Notice accompany the adapter as
+LICENSE-HUNYUAN3D-2.1.txt and NOTICE-HUNYUAN3D-2.1.txt.
+
+The portable ABI remains on PyTorch 2.5.1 + CUDA 12.4 for this adapter build.
+Because weights-only loading is not a security boundary for that runtime, only
+the exact official checkpoint byte counts and SHA-256 values in
+ENGINE-MANIFEST.json are trusted; arbitrary or user-supplied checkpoints are
+rejected. Any public release requires a separate current ABI/CVE review.
+
+The Tencent license limits use, reproduction, and distribution to its defined
+Territory. Hosted pull-request validation therefore checks only this adapter
+and does not fetch or materialize Tencent source or weights. The optional full
+validation is manual, requires explicit license/AUP and Territory confirmations,
+and runs only on a Territory-approved self-hosted runner. It may validate a
+source-materialized build locally but must not upload or publish that build.
+The runner operator is responsible for retaining, protecting, or deleting the
+local files.
+That full-build path also fails before source fetch or package execution until
+all Windows direct and transitive dependencies are locked with SHA-256 hashes.
+A global public GitHub Release cannot enforce the Territory boundary. Any
+distributable engine must instead be materialized locally after the user's
+separate acceptance and Territory confirmation, or be delivered through a
+channel that actually restricts recipients to the Territory.
+
+Before any service, product, or Territory-restricted distribution, the
+publisher must configure its actual full legal name through
+MUJASSAM_PROVIDER_LEGAL_NAME and display it to end users. Tencent is not
+affiliated with, associated with, sponsoring, or endorsing this independent
+integration.
