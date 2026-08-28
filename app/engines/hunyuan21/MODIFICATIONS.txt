@@ -19,6 +19,8 @@ source, Mujassam AI changes it only as needed for the following integration:
   weights-only PyTorch loading as defense in depth rather than the trust
   boundary, and no downloaded model Python code;
 * Windows builds of the official custom rasterizer and differentiable renderer;
+* correction of the official Windows CUDA rasterizer's signed-int64 PyTorch
+  storage accessor while preserving its unsigned CUDA z-buffer atomics;
 * staged progress/error reporting to the Mujassam AI desktop interface;
 * preservation of the high-detail mesh by disabling Paint's optional remesh;
 * export of albedo and metallic-roughness PBR material data in the final GLB;

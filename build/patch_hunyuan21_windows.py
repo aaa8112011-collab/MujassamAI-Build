@@ -17,6 +17,89 @@ def replace_once(path: Path, old: str, new: str, description: str) -> None:
     path.write_text(source.replace(old, new), encoding="utf-8", newline="\n")
 
 
+def patch_windows_rasterizer(root: Path) -> None:
+    """Fix the official Windows CUDA z-buffer without changing its ABI.
+
+    Tencent allocates ``z_min`` as ``torch::kInt64`` but asks PyTorch for a
+    ``uint64_t`` typed pointer.  Recent PyTorch validates that request and
+    raises ``expected scalar type UInt64 but found Long`` before launching the
+    kernel.  The CUDA atomics intentionally remain unsigned; only the typed
+    PyTorch accessor is changed to match the tensor's signed storage.
+
+    The patch is deliberately all-or-nothing and idempotent.  A pristine pinned
+    source must contain the old scalar block once and the bad accessor three
+    times.  A previously patched source must contain the corresponding new
+    markers at exactly those counts.  Any mixed or unknown state is rejected.
+    """
+
+    rasterizer_gpu = (
+        root
+        / "hy3dpaint"
+        / "custom_rasterizer"
+        / "lib"
+        / "custom_rasterizer_kernel_for_windows"
+        / "rasterizer_gpu.cu"
+    )
+    source = rasterizer_gpu.read_text(encoding="utf-8")
+
+    old_scalar = """    uint64_t maxint = (uint64_t)MAXINT * (uint64_t)MAXINT + (MAXINT - 1);
+    auto z_min = torch::ones({height, width}, INT64_options) * (uint64_t)maxint;
+"""
+    new_scalar = """    // Modified by Mujassam AI: preserve torch::kInt64 storage while
+    // exposing its non-negative bit pattern to the official unsigned CUDA atomics.
+    int64_t maxint =
+        static_cast<int64_t>(MAXINT) * static_cast<int64_t>(MAXINT) +
+        (MAXINT - 1);
+    auto z_min = torch::full({height, width}, maxint, INT64_options);
+"""
+    old_accessor = "(uint64_t*)z_min.data_ptr<uint64_t>()"
+    new_accessor = (
+        "reinterpret_cast<uint64_t*>(z_min.data_ptr<int64_t>())"
+    )
+
+    counts = {
+        "old scalar": source.count(old_scalar),
+        "new scalar": source.count(new_scalar),
+        "old accessor": source.count(old_accessor),
+        "new accessor": source.count(new_accessor),
+    }
+    pristine = counts == {
+        "old scalar": 1,
+        "new scalar": 0,
+        "old accessor": 3,
+        "new accessor": 0,
+    }
+    patched = counts == {
+        "old scalar": 0,
+        "new scalar": 1,
+        "old accessor": 0,
+        "new accessor": 3,
+    }
+    if patched:
+        return
+    if not pristine:
+        details = ", ".join(f"{name}={count}" for name, count in counts.items())
+        raise RuntimeError(
+            "Windows rasterizer UInt64/Long patch markers are mixed or "
+            f"unexpected in {rasterizer_gpu}: {details}"
+        )
+
+    patched_source = source.replace(old_scalar, new_scalar)
+    patched_source = patched_source.replace(old_accessor, new_accessor)
+    if (
+        patched_source.count(new_scalar) != 1
+        or patched_source.count(new_accessor) != 3
+        or old_scalar in patched_source
+        or old_accessor in patched_source
+    ):
+        raise RuntimeError(
+            f"Windows rasterizer patch postcondition failed for {rasterizer_gpu}"
+        )
+    rasterizer_gpu.write_text(
+        patched_source, encoding="utf-8", newline="\n"
+    )
+
+
 def patch_source_tree(root: Path) -> None:
     setup_py = root / "hy3dpaint" / "custom_rasterizer" / "setup.py"
     for name in ("rasterizer.cpp", "grid_neighbor.cpp", "rasterizer_gpu.cu"):
@@ -34,6 +117,7 @@ def patch_source_tree(root: Path) -> None:
         "from setuptools import setup, find_packages\n",
         "add the required prominent modification notice to setup.py",
     )
+    patch_windows_rasterizer(root)
 
 
 def patch_staged_vendor(root: Path) -> None:
@@ -281,14 +365,18 @@ def _config_node(value):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("source", "vendor"))
+    parser.add_argument(
+        "mode", choices=("source", "vendor", "rasterizer-runtime")
+    )
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
     root = args.root.resolve()
     if args.mode == "source":
         patch_source_tree(root)
-    else:
+    elif args.mode == "vendor":
         patch_staged_vendor(root)
+    else:
+        patch_windows_rasterizer(root)
     return 0
 
 
