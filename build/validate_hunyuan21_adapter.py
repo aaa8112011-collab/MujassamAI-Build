@@ -22,6 +22,7 @@ LOCAL_BUILD_LAUNCHER = ROOT / "build" / "Build-Hunyuan21-Local.cmd"
 LOCAL_BUILD_RECOVERY = ROOT / "build" / "resume-hunyuan21-local.ps1"
 LOCAL_INSTALLER = ROOT / "installer" / "install-hunyuan21-local.ps1"
 LOCAL_RESTORE = ROOT / "installer" / "restore-hunyuan21-local.ps1"
+LOCAL_REMOVER = ROOT / "installer" / "remove-hunyuan21-local.ps1"
 LOCAL_GUIDE = ROOT / "docs" / "HUNYUAN21-LOCAL-UAE.md"
 SOURCE_COMMIT = "82920d643c0dc2f7bfd7255f45f62d386edfe60c"
 CI_PROVIDER = "CI validation build — Hunyuan3D 2.1 disabled"
@@ -809,6 +810,35 @@ def main() -> int:
     local_recovery = LOCAL_BUILD_RECOVERY.read_text(encoding="utf-8")
     local_installer = LOCAL_INSTALLER.read_text(encoding="utf-8")
     local_restore = LOCAL_RESTORE.read_text(encoding="utf-8")
+    require(LOCAL_REMOVER.is_file(), "Mini-only H21 remover is missing")
+    local_remover = LOCAL_REMOVER.read_text(encoding="utf-8")
+    move_transaction = local_remover[
+        local_remover.index("function Move-ToTransactionQuarantine") :
+        local_remover.index("function Undo-TransactionEntry")
+    ]
+    read_transaction = local_remover[
+        local_remover.index("function Read-TransactionJournal") :
+        local_remover.index("function Assert-HarmlessQuarantineWithoutJournal")
+    ]
+    recover_transactions = local_remover[
+        local_remover.index("function Recover-PendingQuarantineTransactions") :
+        local_remover.index("function Complete-QuarantineTransaction")
+    ]
+    complete_transaction = local_remover[
+        local_remover.index("function Complete-QuarantineTransaction") :
+        local_remover.index("function Restore-OriginalFileTransactional")
+    ]
+    marker_free_executable = local_remover[
+        local_remover.index("function Test-MarkerFreeMiniExecutable") :
+        local_remover.index("function Test-MiniCompletionMarker")
+    ]
+    gui_self_test = local_remover[
+        local_remover.index("$GuiSelfTestReport = Join-Path") :
+        local_remover.index(
+            'Write-Host "تشغيل فحص Mini worker ومحرك Hunyuan2 Mini',
+            local_remover.index("$GuiSelfTestReport = Join-Path"),
+        )
+    ]
     require(
         LOCAL_BUILD_LAUNCHER.is_file() and LOCAL_GUIDE.is_file()
         and "I ACCEPT" in local_build
@@ -898,6 +928,308 @@ def main() -> int:
         ),
         "Local restore path lacks receipt, confirmation, hash, or reparse enforcement",
     )
+    require(
+        "REMOVE_HY21_LATEST_COMPATIBLE_MINI_BASELINE" in local_remover
+        and "REMOVE_HY21_OLDEST_MINI_BASELINE" not in local_remover
+        and "Sort-Object { [IO.Path]::GetFileName($_) } -Descending"
+        in local_remover
+        and "$Baseline = $TrustedBaselines[0]" in local_remover
+        and "Get-TrustedMiniBaseline" in local_remover
+        and "Test-MarkerFreeMiniWorker" in local_remover
+        and "Test-MarkerFreeMiniExecutable $BackupExecutable" in local_remover
+        and '"hunyuan3d_2_1_pbr", "hunyuan21_worker.py"' in local_remover
+        and "$OverwrittenMap.ContainsKey($H21WorkerRelative)" in local_remover
+        and "$CreatedMap.ContainsKey($H21WorkerRelative)" in local_remover
+        and "Get-Sha256 $BackupFile" in local_remover
+        and "install-receipt.json" in local_remover,
+        "H21 removal must choose the latest compatible, marker-free, hash-verified Mini baseline",
+    )
+    require(
+        "Test-AllowedH21ReceiptRelativePath" in local_remover
+        and '"MujassamAI.exe", "NOTICE_THIRD_PARTY.md", "app/worker.py"'
+        in local_remover
+        and '"app/quality", "licenses", "app/engines/hunyuan21"'
+        in local_remover
+        and "Get-ReceiptPathMap $Overwritten" in local_remover
+        and "Get-ReceiptPathMap $Created" in local_remover
+        and "if (-not (Test-AllowedH21ReceiptRelativePath $Relative))"
+        in local_remover
+        and "Test-ProtectedMiniRelativePath" in local_remover
+        and all(
+            f'"{protected}"' in local_remover
+            for protected in (
+                "app/engines/hunyuan2",
+                "rt",
+                "models",
+                "app/vendor",
+                "exports",
+                "export",
+                "output",
+                "outputs",
+                "app/exports",
+                "app/export",
+                "app/output",
+                "app/outputs",
+            )
+        )
+        and '"MujassamAI-Exports"' in local_remover
+        and "$MiniEngineState" in local_remover
+        and "تغيّر ملف خارج Hunyuan3D 2.1" in local_remover
+        and "تغيّر ملف أضافه التحديث خارج مجلد H21" in local_remover,
+        "H21 receipts and cleanup targets must use a positive allowlist and protect Mini/exports/H2",
+    )
+    require(
+        "function Get-NormalizedFullPath" in local_remover
+        and "[IO.Path]::GetPathRoot($Full)" in local_remover
+        and "$Full.Length -gt $VolumeRoot.Length" in local_remover
+        and "$Full.TrimEnd([char[]]@('\\', '/'))" in local_remover
+        and "function Test-PathInsideOrEqual" in local_remover
+        and "function Get-ContainedPath" in local_remover
+        and "Assert-NoReparsePointInExistingPath" in local_remover
+        and "Assert-PathNotProtected" in local_remover
+        and "$ForbiddenInstallRoots" in local_remover
+        and "مسار التثبيت واسع أو حساس أكثر من اللازم" in local_remover,
+        "H21 removal must normalize roots without collapsing volume roots and confine every target",
+    )
+    require(
+        "REMOVE_HY21_EXACT_ENGINE_TREE" in local_remover
+        and '"app/engines/hunyuan21"' in local_remover
+        and '"Engines\\Hunyuan3D-2.1"' in local_remover
+        and '"Licenses\\acceptance-v2-1.txt"' in local_remover
+        and "$AnyH21BackupPattern" in local_remover
+        and "^hunyuan21(?:-rasterizer|-paint-8gb)?-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$"
+        in local_remover
+        and "$PbrUpdateArtifactPattern" in local_remover
+        and "MujassamAI-Hunyuan21-PBR-Update-v1(?:-[0-9]{8}-[0-9]{6}"
+        in local_remover
+        and "install-[0-9a-f]{32}" in local_remover
+        and "rasterizer-[0-9a-f]{32}" in local_remover
+        and ".MujassamAI-hy21-staging-[0-9a-f]{8,32}" in local_remover
+        and "MujassamAI-HunyuanBackup-[0-9a-f]{8}" in local_remover
+        and "MujassamAI-Previous" not in local_remover
+        and "MujassamAI-Failed" not in local_remover
+        and "Assert-NormalTree" in local_remover
+        and "Assert-DirectChildDirectory" in local_remover,
+        "H21 cleanup must use exact timestamped backup/ZIP/TEMP names and reparse-safe roots",
+    )
+    require(
+        "function New-QuarantineTransaction" in local_remover
+        and "function Write-TransactionJournalAtomic" in local_remover
+        and "function Move-ToTransactionQuarantine" in local_remover
+        and "function Undo-TransactionEntry" in local_remover
+        and "function Undo-QuarantineTransaction" in local_remover
+        and "function Complete-QuarantineTransaction" in local_remover
+        and "schema_version = 2" in local_remover
+        and "quarantine_item = [string]$Entry.ItemName" in local_remover
+        and "containment_root = [string]$Entry.ContainmentRoot" in local_remover
+        and "entries = $Entries" in local_remover
+        and 'State = "planned"' in move_transaction
+        and '$MoveRecord.State = "moved"' in move_transaction
+        and move_transaction.index("Write-TransactionJournalAtomic")
+        < move_transaction.index("[IO.Directory]::Move(")
+        and move_transaction.index("Write-TransactionJournalAtomic")
+        < move_transaction.index("[IO.File]::Move(")
+        and move_transaction.index('$MoveRecord.State = "moved"')
+        < move_transaction.rindex("Write-TransactionJournalAtomic")
+        and "$Index = $Transaction.Moves.Count - 1" in local_remover
+        and "quarantine ليس على volume الهدف نفسه" in local_remover
+        and "ReplacementSha256" in local_remover
+        and "Undo-QuarantineTransaction $RestoreTransaction" in local_remover
+        and "Undo-QuarantineTransaction $CleanupTransaction" in local_remover
+        and "Set-QuarantineTransactionCommitted $CleanupTransaction"
+        in local_remover
+        and '$Transaction.State = "committed"' in local_remover
+        and '[string]$Transaction.State -cne "committed"'
+        in complete_transaction
+        and '$Entry.State = "purged"' in complete_transaction
+        and complete_transaction.index('$Entry.State = "purged"')
+        < complete_transaction.index(
+            "Write-TransactionJournalAtomic",
+            complete_transaction.index('$Entry.State = "purged"'),
+        )
+        < complete_transaction.rindex("[IO.File]::Delete($MarkerPath)")
+        and "رُفض purge لمعاملة غير committed" in complete_transaction,
+        "H21 removal must journal before moves, roll back active work, and resumably purge committed work",
+    )
+    require(
+        "$Purpose -cnotin" in local_remover
+        and "$JournalPurpose -cnotin" in read_transaction
+        and "$JournalState -cnotin" in read_transaction
+        and "$Kind -cnotin" in read_transaction
+        and "$EntryState -cnotin" in read_transaction
+        and "$QuarantineItem -cne $ItemName" in read_transaction
+        and '$JournalState -ceq "committed"' in read_transaction
+        and '$JournalPurpose -ceq "restore"' in read_transaction
+        and '$Kind -ceq "file"' in read_transaction
+        and '$EntryState -ceq "replacement-written"' in read_transaction,
+        "Transaction purpose/state/kind/entry enums must be validated with exact case",
+    )
+    require(
+        "function Get-RecoveryContainmentRoot" in local_remover
+        and "$ExpectedContainmentRoot = Get-RecoveryContainmentRoot"
+        in read_transaction
+        and "$ContainmentRoot, $ExpectedContainmentRoot" in read_transaction
+        and "$OriginalVolume, $QuarantineVolume" in read_transaction
+        and "Test-AllowedH21ReceiptRelativePath $Relative" in local_remover
+        and "Test-ProtectedMiniRelativePath $Relative" in local_remover
+        and "$Name -cmatch $PbrUpdateArtifactPattern" in local_remover
+        and "$Name -cmatch $AnyH21BackupPattern" in local_remover
+        and "Assert-PathNotProtected $PathFull" in local_remover
+        and "transaction يملك quarantine مكررًا على volume واحد"
+        in recover_transactions,
+        "Startup recovery must re-derive allowlisted containment and enforce same-volume transactions",
+    )
+    startup_recovery = local_remover.rindex(
+        "Recover-PendingQuarantineTransactions `"
+    )
+    required_file_loop = local_remover.index(
+        "foreach ($RequiredRelative in @(", startup_recovery
+    )
+    require(
+        startup_recovery < required_file_loop
+        and "$AnyActive" in recover_transactions
+        and "Undo-QuarantineTransaction $Transaction" in recover_transactions
+        and "Complete-QuarantineTransaction $Transaction" in recover_transactions
+        and "transaction active يحتوي item purged" in recover_transactions,
+        "Startup must roll back active journals or resume committed purges before requiring Mini files",
+    )
+    require(
+        "function Test-MiniCompletionMarker" in local_remover
+        and "function Write-MiniCompletionMarker" in local_remover
+        and '"mini-only-restored-v1.json"' in local_remover
+        and "schema_version = 1" in local_remover
+        and "install_root = $InstallRoot" in local_remover
+        and all(
+            marker_hash in local_remover
+            for marker_hash in (
+                "mujassam_exe_sha256",
+                "mini_worker_sha256",
+                "hunyuan2_worker_sha256",
+                "hunyuan2_manifest_sha256",
+            )
+        )
+        and "$HasValidCompletionMarker" in local_remover
+        and "$CurrentWorkerIsMarkerFree" in local_remover
+        and "$CurrentExecutableIsMarkerFree" in local_remover
+        and "نسخة Mini الحالية مثبتة بعلامة اكتمال موثوقة" in local_remover,
+        "A hash-bound completion marker must make an already-restored Mini rerun idempotent",
+    )
+    require(
+        "[switch]$DeepCleanup" in local_remover
+        and "REMOVE_HY21_DEEP_CLEANUP_GATE" in local_remover
+        and "if (-not $DeepCleanup)" in local_remover
+        and "if ($DeepCleanup -and" in local_remover
+        and "للتنظيف الكامل أعد الأمر نفسه مع -DeepCleanup" in local_remover
+        and "ShouldProcess" in local_remover
+        and "Assert-DeepCleanupPhaseReady" in local_remover
+        and "Assert-MujassamProcessesStopped" in local_remover,
+        "Large H21 cleanup and backup purging must require explicit -DeepCleanup and fresh process gates",
+    )
+    require(
+        "REMOVE_HY21_BASELINE_PREFLIGHT" in local_remover
+        and "function Test-MarkerFreeMiniExecutable" in local_remover
+        and "$Bytes[0] -ne 0x4d" in marker_free_executable
+        and "$Bytes[1] -ne 0x5a" in marker_free_executable
+        and "[Text.Encoding]::UTF8.GetString($Bytes)" in marker_free_executable
+        and "[Text.Encoding]::Unicode.GetString($Bytes)" in marker_free_executable
+        and "$Utf16EvenText" in marker_free_executable
+        and "$Utf16OddText" in marker_free_executable
+        and '"Hunyuan3D 2.1 Ultimate"' in marker_free_executable
+        and local_remover.count("Test-MarkerFreeMiniExecutable") >= 5
+        and "Test-MarkerFreeMiniExecutable $PreflightMiniExecutable"
+        in local_remover
+        and "Test-MarkerFreeMiniExecutable $MiniExecutable" in local_remover
+        and "& $PortablePython -I -X utf8 $PreflightMiniWorker --self-test"
+        in local_remover
+        and local_remover.index(
+            "& $PortablePython -I -X utf8 $PreflightMiniWorker --self-test"
+        )
+        < local_remover.index("$PSCmdlet.ShouldProcess("),
+        "Baseline/current/preflight/post-restore Mini PE files must be marker-free in ASCII/UTF-16",
+    )
+    require(
+        "function Test-TreeContainsUserOutput" in local_remover
+        and "$Pending = [Collections.Generic.Stack[string]]::new()"
+        in local_remover
+        and "MujassamAI-Exports|\\.git" in local_remover
+        and local_remover.count("Test-TreeContainsUserOutput") >= 4
+        and "Test-PathInsideOrEqual $RootPath $DirectoryFull" in local_remover
+        and "Test-PathInsideOrEqual $Context.InstallRoot $PathFull"
+        in local_remover
+        and "تُرك مجلد setup لأنه يحتوي export/output أو .git" in local_remover
+        and "setup artifact recovery يحتوي export/output أو .git"
+        in local_remover
+        and "ظهر export/output أو .git داخل مجلد setup قبل cleanup"
+        in local_remover,
+        "Live cleanup and recovery must symmetrically skip nested user output and overlapping setup trees",
+    )
+    require(
+        "Select-InactiveH21CleanupDirectories" in local_remover
+        and "Get-CimInstance -ClassName Win32_Process" in local_remover
+        and "build-hunyuan21-local.ps1" in local_remover
+        and "install-hunyuan21-local.ps1" in local_remover
+        and "$DeferredGlobalCleanupWarning" in local_remover,
+        "Global H21 TEMP/staging cleanup must defer while another build/install is active",
+    )
+    require(
+        "REMOVE_HY21_DEFER_RECEIPT_TREE" in local_remover
+        and local_remover.count("if (Test-H21EngineRelativePath $Relative)") >= 4
+        and "continue" in local_remover
+        and "Assert-NormalTree validates the exact root once" in local_remover,
+        "Receipt files inside H21 must defer to one exact-tree cleanup for performance",
+    )
+    require(
+        '"app/engines/hunyuan2/hunyuan2_worker.py"' in local_remover
+        and '"app/engines/hunyuan2/ENGINE-MANIFEST.json"' in local_remover
+        and "$Hunyuan2WorkerSha256" in local_remover
+        and "$Hunyuan2ManifestSha256" in local_remover
+        and "& $MiniExecutable" not in local_remover
+        and "$GuiSelfTestProcess = Start-Process `" in gui_self_test
+        and "-FilePath $MiniExecutable `" in gui_self_test
+        and "-ArgumentList $GuiSelfTestArguments `" in gui_self_test
+        and "-Wait -PassThru -ErrorAction Stop" in gui_self_test
+        and "$GuiSelfTestExitCode = $GuiSelfTestProcess.ExitCode"
+        in gui_self_test
+        and "$GuiSelfTestExitCode -ne 0" in gui_self_test
+        and "} finally {" in gui_self_test
+        and "$GuiSelfTestProcess.Dispose()" in gui_self_test
+        and gui_self_test.index("$GuiSelfTestProcess.Dispose()")
+        < gui_self_test.index("Remove-TemporaryFileBestEffort $GuiSelfTestReport")
+        and "PortableLayout=OK" in local_remover
+        and "JobSchema=OK" in local_remover
+        and "Is64BitProcess=True" in local_remover
+        and "& $PortablePython -I -X utf8 $MiniWorker --self-test" in local_remover
+        and "& $PortablePython -I -X utf8 $Hunyuan2Worker --self-test" in local_remover,
+        "H21 removal must wait for the GUI winexe, inspect ExitCode/report, and self-test Mini/H2",
+    )
+    remover_self_test = local_remover.rindex(
+        "& $PortablePython -I -X utf8 $Hunyuan2Worker --self-test"
+    )
+    remover_completion = local_remover.index("Write-MiniCompletionMarker `")
+    remover_deep_gate = local_remover.index("REMOVE_HY21_DEEP_CLEANUP_GATE")
+    remover_cleanup = local_remover.index("REMOVE_HY21_EXACT_ENGINE_TREE")
+    require(
+        remover_self_test < remover_completion < remover_deep_gate < remover_cleanup,
+        "Destructive H21 cleanup must start only after Mini tests, completion, and the explicit gate",
+    )
+    for forbidden_remover_action in (
+        "Invoke-WebRequest",
+        "Invoke-RestMethod",
+        "curl.exe",
+        "github.com",
+        "New-Item",
+        "Copy-Item",
+        "Remove-Item",
+        "Move-Item",
+        "Rename-Item",
+        "Set-Content",
+        "Add-Content",
+        "Out-File",
+    ):
+        require(
+            forbidden_remover_action not in local_remover,
+            f"Mini-only remover may not use network/provider mutation: {forbidden_remover_action}",
+        )
     for forbidden_installer_network in (
         "Invoke-WebRequest",
         "Invoke-RestMethod",
@@ -937,6 +1269,60 @@ def main() -> int:
     require(
         '"build/hotfix-hunyuan21-paint-8gb.ps1"' in workflow,
         "Hosted static validation must parse the Paint 8GB worker hotfix",
+    )
+    require(
+        '"installer/remove-hunyuan21-local.ps1"' in workflow
+        and "MJHUNYUAN21REMOVESELFTEST|OK|2" in workflow
+        and "MJHUNYUAN21DEEPSELFTEST|OK|2" in workflow
+        and "MJHUNYUAN21ROLLBACKSELFTEST|OK|1" in workflow
+        and "MJHUNYUAN21ACTIVERECOVERYSELFTEST|OK|1" in workflow
+        and "MJHUNYUAN21COMMITTEDRECOVERYSELFTEST|OK|1" in workflow
+        and "MJHUNYUAN21PBRBASEREJECTSELFTEST|OK|1" in workflow
+        and "MJHUNYUAN21SETUPPROTECTSELFTEST|OK|1" in workflow
+        and "MJHUNYUAN21GUIWAITSELFTEST|OK|1" in workflow
+        and workflow.count("& ./installer/remove-hunyuan21-local.ps1") >= 3
+        and "DeepCleanup = $true" in workflow
+        and 'schema_version = 2' in workflow
+        and 'state = "active"' in workflow
+        and 'state = "committed"' in workflow
+        and 'quarantine_item = "item-000000"' in workflow
+        and "containment_root = $Install" in workflow
+        and '"MujassamAI\\Engines\\Hunyuan3D-2\\models\\mini.keep"' in workflow
+        and '"Downloads\\MujassamAI-Exports\\model.glb"' in workflow
+        and '"Downloads\\MujassamAI-Build-UAE-test\\repo.keep"' in workflow
+        and "MujassamAI-Hunyuan21-PBR-Update-v1-20260827-104834.zip"
+        in workflow
+        and '"HunyuanUpdateCache", "UpdaterLogs", "InstallerCache", "InstallerLogs"'
+        in workflow
+        and '"MujassamAI-Previous-123456abcdef"' in workflow
+        and '"MujassamAI-Failed-fedcba654321"' in workflow
+        and '(Join-Path $PreviousSetup "keep")' in workflow
+        and '(Join-Path $FailedSetup "keep")' in workflow
+        and '(Join-Path $NestedExportSetup "nested\\Exports\\model.glb")'
+        in workflow
+        and "Previous/Failed are intentionally outside the exact cleanup"
+        in workflow
+        and '"MujassamAI\\mini-only-restored-v1.json"' in workflow
+        and "Transactional rollback did not restore the exact PBR state"
+        in workflow
+        and "Rollback left an active quarantine behind" in workflow
+        and "Active-restore fixture failed to hide the required worker"
+        in workflow
+        and "Committed partial-purge recovery remains"
+        in workflow
+        and "RejectedPbrExeBackup" in workflow
+        and '/target:winexe "/out:$OriginalExe"' in workflow
+        and '/target:winexe "/out:$FailingMiniExe"' in workflow
+        and "$GuiWaitPattern" in workflow
+        and "-Wait\\s+-PassThru\\s+-ErrorAction\\s+Stop" in workflow
+        and "$GuiSelfTestProcess.Dispose()" in workflow
+        and "exit code:\\s*23" in workflow
+        and 'source.Contains("MJSELFTEST|OK|3")' in workflow
+        and 'source.Contains("MJHUNYUANSELFTEST|OK|1")' in workflow
+        and 'File.ReadAllText(script)' in workflow
+        and "^hunyuan21(?:-rasterizer|-paint-8gb)?-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$"
+        in workflow,
+        "Hosted validation must exercise deep cleanup, idempotence, preservation, and rollback",
     )
     require(
         "importlib.util.spec_from_file_location(" in workflow

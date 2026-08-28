@@ -46,7 +46,7 @@ jobs:
           python-version: "3.11.9"
           architecture: x64
 
-      - name: Validate repository-owned adapter without Tencent source or weights
+      - name: Compile repository-owned Python sources
         shell: pwsh
         run: |
           python -m py_compile `
@@ -55,11 +55,22 @@ jobs:
             build/patch_hunyuan21_windows.py `
             build/validate_hunyuan21_adapter.py
           if ($LASTEXITCODE -ne 0) { throw "Python compilation failed" }
+
+      - name: Validate repository-owned adapter without Tencent source or weights
+        shell: pwsh
+        run: |
           python build/validate_hunyuan21_adapter.py
           if ($LASTEXITCODE -ne 0) { throw "Adapter static validation failed" }
+
+      - name: Run base worker self-test
+        shell: pwsh
+        run: |
           python app/worker.py --self-test
           if ($LASTEXITCODE -ne 0) { throw "Base worker self-test failed" }
 
+      - name: Run Paint low-VRAM model-free self-test
+        shell: pwsh
+        run: |
           $LowVramSelfTest = @'
           import importlib.util
           import sys
@@ -81,6 +92,9 @@ jobs:
           $LowVramSelfTest | python -S -
           if ($LASTEXITCODE -ne 0) { throw "Paint low-VRAM self-test failed" }
 
+      - name: Parse established PowerShell sources
+        shell: pwsh
+        run: |
           foreach ($ScriptPath in @(
             "build/build-hunyuan21-update.ps1",
             "build/hotfix-hunyuan21-rasterizer.ps1",
@@ -99,6 +113,711 @@ jobs:
               throw "PowerShell syntax failed for ${ScriptPath}: $Messages"
             }
           }
+
+      - name: Parse Mini-only removal script
+        shell: pwsh
+        run: |
+          $Tokens = $null
+          $Errors = $null
+          [Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "installer/remove-hunyuan21-local.ps1"),
+            [ref]$Tokens, [ref]$Errors) | Out-Null
+          if ($Errors.Count -ne 0) {
+            $Messages = @($Errors | ForEach-Object {
+              "line $($_.Extent.StartLineNumber): $($_.Message)"
+            }) -join "; "
+            throw "PowerShell syntax failed for Mini-only remover: $Messages"
+          }
+
+      - name: Verify GUI Mini self-test wait guard
+        shell: pwsh
+        run: |
+          $RemoverSource = Get-Content `
+            "installer/remove-hunyuan21-local.ps1" -Raw
+          $GuiWaitPattern = `
+            '(?s)\$GuiSelfTestProcess\s*=\s*Start-Process.*?-Wait\s+-PassThru\s+-ErrorAction\s+Stop.*?\$GuiSelfTestExitCode\s*=\s*\$GuiSelfTestProcess\.ExitCode'
+          if ($RemoverSource -cnotmatch $GuiWaitPattern -or
+              -not $RemoverSource.Contains('$GuiSelfTestProcess.Dispose()')) {
+            throw "GUI Mini self-test must wait for winexe and consume ExitCode"
+          }
+          Write-Host "MJHUNYUAN21GUIWAITSELFTEST|OK|1"
+
+      - name: Exercise transactional H21 deep cleanup and rollback
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $TestRoot = Join-Path $env:RUNNER_TEMP (
+            "mujassam-h21-remove-" + [Guid]::NewGuid().ToString("N"))
+          # Both the current InstallRoot and its parent deliberately resemble
+          # setup leftovers.  Neither may ever become a cleanup target.
+          $SetupAncestor = Join-Path $TestRoot "MAI-13579bdf"
+          $Install = Join-Path $SetupAncestor "MHU-2468ace0"
+          $Local = Join-Path $TestRoot "local"
+          $Profile = Join-Path $TestRoot "profile"
+          $Temp = Join-Path $TestRoot "temp"
+          foreach ($Directory in @(
+            $SetupAncestor, $Install, $Local, $Profile, $Temp
+          )) {
+            [IO.Directory]::CreateDirectory($Directory) | Out-Null
+          }
+
+          function Write-TestText([string]$Path, [string]$Text) {
+            $Parent = [IO.Path]::GetDirectoryName($Path)
+            [IO.Directory]::CreateDirectory($Parent) | Out-Null
+            [IO.File]::WriteAllText(
+              $Path, $Text, [Text.UTF8Encoding]::new($false))
+          }
+          function Get-TestSha256([string]$Path) {
+            (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+
+          $PortableRuntime = Join-Path $Install "rt"
+          [IO.Directory]::CreateDirectory($PortableRuntime) | Out-Null
+          $StubSource = Join-Path $TestRoot "python-stub.cs"
+          Write-TestText $StubSource @'
+          using System;
+          using System.IO;
+          internal static class Program
+          {
+              private static int Main(string[] args)
+              {
+                  if (Array.IndexOf(args, "--self-test") < 0) return 7;
+                  string script = null;
+                  foreach (string value in args)
+                  {
+                      if (value.EndsWith(".py", StringComparison.OrdinalIgnoreCase) &&
+                          File.Exists(value)) script = value;
+                  }
+                  if (script == null) return 8;
+                  string source = File.ReadAllText(script);
+                  if (!source.Contains("MJSELFTEST|OK|3") &&
+                      !source.Contains("MJHUNYUANSELFTEST|OK|1")) return 9;
+                  Console.WriteLine("MJSELFTEST|OK|3");
+                  return 0;
+              }
+          }
+          '@
+          $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $VsInstall = & $VsWhere -latest -products * -requires Microsoft.Component.MSBuild `
+              -property installationPath | Select-Object -First 1
+          if (-not $VsInstall) { throw "Visual Studio compiler was not found" }
+          $Csc = Join-Path $VsInstall "MSBuild\Current\Bin\Roslyn\csc.exe"
+          $PortablePython = Join-Path $PortableRuntime "python.exe"
+          & $Csc /nologo /target:exe "/out:$PortablePython" $StubSource
+          if ($LASTEXITCODE -ne 0) { throw "Could not compile the portable test stub" }
+
+          $OriginalExe = Join-Path $TestRoot "original-MujassamAI.exe"
+          $GuiStubSource = Join-Path $TestRoot "gui-stub.cs"
+          Write-TestText $GuiStubSource @'
+          using System;
+          using System.IO;
+          using System.Text;
+          internal static class Program
+          {
+              private static int Main(string[] args)
+              {
+                  if (args.Length < 2 || args[0] != "--self-test") return 7;
+                  File.WriteAllText(args[1],
+                      "PortableLayout=OK\nJobSchema=OK\nIs64BitProcess=True\n",
+                      new UTF8Encoding(false));
+                  return 0;
+              }
+          }
+          '@
+          & $Csc /nologo /target:winexe "/out:$OriginalExe" $GuiStubSource
+          if ($LASTEXITCODE -ne 0) { throw "Could not compile the GUI test stub" }
+          $InstalledExe = Join-Path $Install "MujassamAI.exe"
+          [IO.File]::WriteAllBytes(
+            $InstalledExe, [Text.Encoding]::ASCII.GetBytes("MZ-pbr-installed"))
+          $OriginalWorker = Join-Path $TestRoot "original-worker.py"
+          $InstalledWorker = Join-Path $Install "app\worker.py"
+          Write-TestText $OriginalWorker 'print("MJSELFTEST|OK|3")'
+          Write-TestText $InstalledWorker 'ENGINE = "hunyuan3d_2_1_pbr"'
+          $Hunyuan2Worker = Join-Path $Install `
+            "app\engines\hunyuan2\hunyuan2_worker.py"
+          $Hunyuan2Manifest = Join-Path $Install `
+            "app\engines\hunyuan2\ENGINE-MANIFEST.json"
+          Write-TestText $Hunyuan2Worker 'print("MJHUNYUANSELFTEST|OK|1")'
+          Write-TestText $Hunyuan2Manifest '{"engine":"mini"}'
+          $Hunyuan2WorkerHash = Get-TestSha256 $Hunyuan2Worker
+          $Hunyuan2ManifestHash = Get-TestSha256 $Hunyuan2Manifest
+          Write-TestText (Join-Path $Install "models\mini.keep") "keep-models"
+          Write-TestText (Join-Path $Install "app\vendor\mini.keep") "keep-vendor"
+          Write-TestText (Join-Path $Install "app\user.keep") "keep-user"
+
+          $InstalledH21Worker = Join-Path $Install `
+            "app\engines\hunyuan21\hunyuan21_worker.py"
+          $InstalledH21Payload = "pbr-worker-before-hotfix"
+          Write-TestText $InstalledH21Worker $InstalledH21Payload
+          $ReceiptH21WorkerHash = Get-TestSha256 $InstalledH21Worker
+          # A later hotfix hash is intentionally permitted only in this tree.
+          Write-TestText $InstalledH21Worker "pbr-worker-after-hotfix"
+          Write-TestText (Join-Path $Install `
+            "app\engines\hunyuan21\unreceipted-hotfix.keep") "remove-tree"
+          $OutsideCreated = Join-Path $Install "app\quality\ultimate-only.keep"
+          Write-TestText $OutsideCreated "receipt-owned"
+
+          $BackupParent = Join-Path $Local "MujassamAI\Backups"
+          $Baseline = Join-Path $BackupParent `
+            "hunyuan21-20000101T000000Z-1234abcd"
+          [IO.Directory]::CreateDirectory($Baseline) | Out-Null
+          [IO.Directory]::CreateDirectory(
+            (Join-Path $Baseline "app")) | Out-Null
+          [IO.File]::Copy(
+            $OriginalExe, (Join-Path $Baseline "MujassamAI.exe"), $false)
+          [IO.File]::Copy(
+            $OriginalWorker, (Join-Path $Baseline "app\worker.py"), $false)
+          $OriginalExeBackup = Join-Path $Baseline "MujassamAI.exe"
+          $OriginalWorkerBackup = Join-Path $Baseline "app\worker.py"
+          $OriginalExeHash = Get-TestSha256 $OriginalExeBackup
+          $OriginalWorkerHash = Get-TestSha256 $OriginalWorkerBackup
+          $Receipt = [ordered]@{
+            schema_version = 1
+            created_utc = "2000-01-01T00:00:00.0000000+00:00"
+            install_root = $Install
+            update_zip = (Join-Path $Profile `
+              "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1.zip")
+            update_zip_sha256 = ("0" * 64)
+            overwritten_files = @(
+              [ordered]@{
+                path = "MujassamAI.exe"
+                bytes = [IO.File]::ReadAllBytes($OriginalExeBackup).Length
+                sha256 = (Get-TestSha256 $OriginalExeBackup)
+                installed_sha256 = (Get-TestSha256 $InstalledExe)
+              },
+              [ordered]@{
+                path = "app/worker.py"
+                bytes = (Get-Item -LiteralPath $OriginalWorkerBackup).Length
+                sha256 = (Get-TestSha256 $OriginalWorkerBackup)
+                installed_sha256 = (Get-TestSha256 $InstalledWorker)
+              }
+            )
+            created_files = @(
+              [ordered]@{
+                path = "app/engines/hunyuan21/hunyuan21_worker.py"
+                installed_sha256 = $ReceiptH21WorkerHash
+              },
+              [ordered]@{
+                path = "app/quality/ultimate-only.keep"
+                installed_sha256 = (Get-TestSha256 $OutsideCreated)
+              }
+            )
+          }
+          Write-TestText (Join-Path $Baseline "install-receipt.json") `
+            ($Receipt | ConvertTo-Json -Depth 8)
+
+          # A newer, otherwise valid receipt has a marker-free worker but its
+          # saved PE is PBR-tainted.  It must be rejected in favor of the older
+          # real Mini baseline rather than restored or accepted by a marker.
+          $RejectedPbrExeBackup = Join-Path $BackupParent `
+            "hunyuan21-20000105T000000Z-badc0ffe"
+          [IO.Directory]::CreateDirectory($RejectedPbrExeBackup) | Out-Null
+          $RejectedPbrExe = Join-Path $RejectedPbrExeBackup "MujassamAI.exe"
+          [IO.File]::WriteAllBytes($RejectedPbrExe,
+            [Text.Encoding]::ASCII.GetBytes(
+              "MZ-hunyuan3d_2_1_pbr-newer-false-baseline"))
+          $RejectedPbrWorker = Join-Path $RejectedPbrExeBackup "app\worker.py"
+          Write-TestText $RejectedPbrWorker 'print("MJSELFTEST|OK|3")'
+          $RejectedPbrReceipt = [ordered]@{
+            schema_version = 1
+            created_utc = "2000-01-05T00:00:00.0000000+00:00"
+            install_root = $Install
+            update_zip = (Join-Path $Profile `
+              "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1.zip")
+            update_zip_sha256 = ("5" * 64)
+            overwritten_files = @(
+              [ordered]@{
+                path = "MujassamAI.exe"
+                bytes = (Get-Item -LiteralPath $RejectedPbrExe).Length
+                sha256 = (Get-TestSha256 $RejectedPbrExe)
+                installed_sha256 = (Get-TestSha256 $InstalledExe)
+              },
+              [ordered]@{
+                path = "app/worker.py"
+                bytes = (Get-Item -LiteralPath $RejectedPbrWorker).Length
+                sha256 = (Get-TestSha256 $RejectedPbrWorker)
+                installed_sha256 = (Get-TestSha256 $InstalledWorker)
+              }
+            )
+            created_files = @(
+              [ordered]@{
+                path = "app/engines/hunyuan21/hunyuan21_worker.py"
+                installed_sha256 = $ReceiptH21WorkerHash
+              },
+              [ordered]@{
+                path = "app/quality/ultimate-only.keep"
+                installed_sha256 = (Get-TestSha256 $OutsideCreated)
+              }
+            )
+          }
+          Write-TestText (Join-Path $RejectedPbrExeBackup `
+            "install-receipt.json") `
+            ($RejectedPbrReceipt | ConvertTo-Json -Depth 8)
+
+          # This other later original-looking directory has no receipt.
+          $RejectedLaterBackup = Join-Path $BackupParent `
+            "hunyuan21-20000102T000000Z-deadbeef"
+          Write-TestText (Join-Path $RejectedLaterBackup "not-a-receipt.keep") "reject"
+          $PaintBackup = Join-Path $BackupParent `
+            "hunyuan21-paint-8gb-20000103T000000Z-feedface"
+          $RasterizerBackup = Join-Path $BackupParent `
+            "hunyuan21-rasterizer-20000104T000000Z-cafebabe"
+          $UnrelatedBackup = Join-Path $BackupParent "hunyuan2-keep"
+          Write-TestText (Join-Path $BackupParent `
+            "hunyuan21-paint-8gb-20000103T000000Z-feedface\worker.keep") "remove"
+          Write-TestText (Join-Path $RasterizerBackup "worker.keep") "remove"
+          Write-TestText (Join-Path $UnrelatedBackup "mini.keep") "keep"
+          Write-TestText (Join-Path $Local `
+            "MujassamAI\Engines\Hunyuan3D-2.1\models\pbr.keep") "remove"
+          Write-TestText (Join-Path $Local `
+            "MujassamAI\Engines\Hunyuan3D-2\models\mini.keep") "keep"
+          Write-TestText (Join-Path $Local `
+            "MujassamAI\Licenses\acceptance-v2-1.txt") "remove"
+          foreach ($AppCleanupName in @(
+            "HunyuanUpdateCache", "UpdaterLogs", "InstallerCache", "InstallerLogs"
+          )) {
+            Write-TestText (Join-Path $Local `
+              "MujassamAI\$AppCleanupName\h21.keep") "remove"
+          }
+          Write-TestText (Join-Path $Local `
+            "MujassamAI\UnrelatedCache\mini.keep") "keep"
+          Write-TestText (Join-Path $Profile `
+            "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1.zip") "remove"
+          Write-TestText (Join-Path $Profile `
+            "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1.zip.sha256") "remove"
+          Write-TestText (Join-Path $Profile `
+            "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1-20260827-104834.zip") `
+            "remove"
+          Write-TestText (Join-Path $Profile `
+            "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1-20260827-104834.zip.sha256") `
+            "remove"
+          Write-TestText (Join-Path $Profile `
+            "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1-20260827-104835-deadbeef.zip") `
+            "remove"
+          Write-TestText (Join-Path $Profile `
+            "Downloads\keep.zip") "keep"
+          Write-TestText (Join-Path $Profile `
+            "Downloads\MujassamAI-Exports\model.glb") "keep"
+          Write-TestText (Join-Path $Profile `
+            "Documents\MujassamAI-Exports\model.glb") "keep"
+          Write-TestText (Join-Path $Install "exports\model.glb") "keep"
+          Write-TestText (Join-Path $Profile `
+            "Downloads\MujassamAI-Build-UAE-test\repo.keep") "keep"
+          foreach ($SetupName in @(
+            "MAI-1234abcd", "MHU-89abcdef",
+            "MujassamAI-HunyuanBackup-deadbeef"
+          )) {
+            Write-TestText (Join-Path $SetupAncestor `
+              "$SetupName\h21.keep") "remove"
+          }
+          # Previous/Failed are intentionally outside the exact cleanup
+          # contract, and a setup-looking tree with nested exports is user data.
+          $PreviousSetup = Join-Path $SetupAncestor `
+            "MujassamAI-Previous-123456abcdef"
+          $FailedSetup = Join-Path $SetupAncestor `
+            "MujassamAI-Failed-fedcba654321"
+          $NestedExportSetup = Join-Path $SetupAncestor "MAI-feedface"
+          Write-TestText (Join-Path $PreviousSetup "keep") "keep"
+          Write-TestText (Join-Path $FailedSetup "keep") "keep"
+          Write-TestText (Join-Path $NestedExportSetup `
+            "nested\Exports\model.glb") "keep"
+          Write-TestText (Join-Path $SetupAncestor "ancestor.keep") "keep"
+          Write-TestText (Join-Path $SetupAncestor "other-install\keep") "keep"
+          Write-TestText (Join-Path $Temp `
+            ("MujassamAI-hy21-" + ("a" * 32) + "\temp.keep")) "remove"
+          Write-TestText (Join-Path $Temp `
+            ("MujassamAI-hy21-install-" + ("b" * 32) + "\temp.keep")) "remove"
+          Write-TestText (Join-Path $Temp `
+            ("MujassamAI-hy21-rasterizer-" + ("c" * 32) + "\temp.keep")) "remove"
+          Write-TestText (Join-Path $Temp "other-temp\keep") "keep"
+          Write-TestText (Join-Path $Profile `
+            ("Documents\.MujassamAI-hy21-staging-" + ("d" * 32) +
+              "\stage.keep")) "remove"
+          Write-TestText (Join-Path $Profile "Documents\user-folder\keep") "keep"
+
+          # Simulate closing PowerShell after app/worker.py was atomically
+          # renamed but before the journal advanced from planned -> moved.
+          # Startup recovery must restore this required file before preflight.
+          $RestoreCrashId = "1" * 32
+          $RestoreCrashQuarantine = Join-Path $Install `
+            ".MujassamAI-hy21-quarantine-$RestoreCrashId"
+          [IO.Directory]::CreateDirectory($RestoreCrashQuarantine) | Out-Null
+          $RestoreCrashItem = Join-Path $RestoreCrashQuarantine "item-000000"
+          $RestoreCrashOriginalHash = Get-TestSha256 $InstalledWorker
+          [IO.File]::Move($InstalledWorker, $RestoreCrashItem, $false)
+          $RestoreCrashJournal = [ordered]@{
+            schema_version = 2
+            transaction_id = $RestoreCrashId
+            purpose = "restore"
+            state = "active"
+            install_root = $Install
+            entries = @(
+              [ordered]@{
+                item_name = "item-000000"
+                quarantine_item = "item-000000"
+                original_path = $InstalledWorker
+                containment_root = $Install
+                kind = "file"
+                original_sha256 = $RestoreCrashOriginalHash
+                replacement_sha256 = $OriginalWorkerHash
+                state = "planned"
+              }
+            )
+          }
+          Write-TestText (Join-Path $RestoreCrashQuarantine `
+            "transaction.json") ($RestoreCrashJournal | ConvertTo-Json -Depth 8)
+          if (Test-Path -LiteralPath $InstalledWorker) {
+            throw "Active-restore fixture failed to hide the required worker"
+          }
+
+          $RemoveArguments = @{
+            InstallRoot = $Install
+            LocalApplicationDataRoot = $Local
+            UserProfileRoot = $Profile
+            TemporaryRoot = $Temp
+            DeepCleanup = $true
+            Confirm = $false
+          }
+          & ./installer/remove-hunyuan21-local.ps1 @RemoveArguments
+          if ($LASTEXITCODE -ne 0) { throw "First Mini-only removal failed" }
+
+          if ((Get-TestSha256 $InstalledExe) -cne $OriginalExeHash -or
+              (Get-TestSha256 $InstalledWorker) -cne $OriginalWorkerHash -or
+              (Get-TestSha256 $Hunyuan2Worker) -cne $Hunyuan2WorkerHash -or
+              (Get-TestSha256 $Hunyuan2Manifest) -cne $Hunyuan2ManifestHash) {
+            throw "Mini files were not restored/preserved exactly"
+          }
+          foreach ($Removed in @(
+            (Join-Path $Install "app\engines\hunyuan21"),
+            $OutsideCreated,
+            $Baseline,
+            $RejectedPbrExeBackup,
+            $RejectedLaterBackup,
+            $PaintBackup,
+            $RasterizerBackup,
+            $RestoreCrashQuarantine,
+            (Join-Path $Local "MujassamAI\Engines\Hunyuan3D-2.1"),
+            (Join-Path $Local "MujassamAI\Licenses\acceptance-v2-1.txt"),
+            (Join-Path $Local "MujassamAI\HunyuanUpdateCache"),
+            (Join-Path $Local "MujassamAI\UpdaterLogs"),
+            (Join-Path $Local "MujassamAI\InstallerCache"),
+            (Join-Path $Local "MujassamAI\InstallerLogs"),
+            (Join-Path $Profile `
+              "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1.zip"),
+            (Join-Path $Profile `
+              "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1.zip.sha256"),
+            (Join-Path $Profile `
+              "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1-20260827-104834.zip"),
+            (Join-Path $Profile `
+              "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1-20260827-104834.zip.sha256"),
+            (Join-Path $Profile `
+              "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1-20260827-104835-deadbeef.zip"),
+            (Join-Path $SetupAncestor "MAI-1234abcd"),
+            (Join-Path $SetupAncestor "MHU-89abcdef"),
+            (Join-Path $SetupAncestor "MujassamAI-HunyuanBackup-deadbeef"),
+            (Join-Path $Temp ("MujassamAI-hy21-" + ("a" * 32))),
+            (Join-Path $Temp ("MujassamAI-hy21-install-" + ("b" * 32))),
+            (Join-Path $Temp ("MujassamAI-hy21-rasterizer-" + ("c" * 32))),
+            (Join-Path $Profile `
+              ("Documents\.MujassamAI-hy21-staging-" + ("d" * 32)))
+          )) {
+            if (Test-Path -LiteralPath $Removed) {
+              throw "Expected removal target remains: $Removed"
+            }
+          }
+          foreach ($Preserved in @(
+            (Join-Path $Install "models\mini.keep"),
+            (Join-Path $Install "app\vendor\mini.keep"),
+            (Join-Path $Install "app\user.keep"),
+            (Join-Path $Install "exports\model.glb"),
+            (Join-Path $Local "MujassamAI\Engines\Hunyuan3D-2\models\mini.keep"),
+            (Join-Path $Local "MujassamAI\UnrelatedCache\mini.keep"),
+            (Join-Path $UnrelatedBackup "mini.keep"),
+            (Join-Path $Profile "Downloads\keep.zip"),
+            (Join-Path $Profile "Downloads\MujassamAI-Exports\model.glb"),
+            (Join-Path $Profile "Documents\MujassamAI-Exports\model.glb"),
+            (Join-Path $Profile "Downloads\MujassamAI-Build-UAE-test\repo.keep"),
+            (Join-Path $PreviousSetup "keep"),
+            (Join-Path $FailedSetup "keep"),
+            (Join-Path $NestedExportSetup "nested\Exports\model.glb"),
+            (Join-Path $SetupAncestor "ancestor.keep"),
+            (Join-Path $SetupAncestor "other-install\keep"),
+            (Join-Path $Temp "other-temp\keep"),
+            (Join-Path $Profile "Documents\user-folder\keep")
+          )) {
+            if (-not (Test-Path -LiteralPath $Preserved -PathType Leaf)) {
+              throw "Protected/unrelated file was removed: $Preserved"
+            }
+          }
+
+          $CompletionMarker = Join-Path $Local `
+            "MujassamAI\mini-only-restored-v1.json"
+          if (-not (Test-Path -LiteralPath $CompletionMarker -PathType Leaf)) {
+            throw "Mini completion marker is missing after DeepCleanup"
+          }
+
+          # Model a crash after one committed item was purged and journaled,
+          # while a second item and transaction.json still remain.  The next
+          # run must finish the item, persist its purged state, then delete the
+          # journal last and remove the empty quarantine root.
+          $DownloadsRoot = Join-Path $Profile "Downloads"
+          $CommittedCrashId = "2" * 32
+          $CommittedCrashQuarantine = Join-Path $DownloadsRoot `
+            ".MujassamAI-hy21-quarantine-$CommittedCrashId"
+          [IO.Directory]::CreateDirectory($CommittedCrashQuarantine) | Out-Null
+          $AlreadyPurgedDownload = Join-Path $DownloadsRoot `
+            "MujassamAI-Hunyuan21-PBR-Update-v1-20260827-120000.zip"
+          $RemainingCommittedDownload = Join-Path $DownloadsRoot `
+            "MujassamAI-Hunyuan21-PBR-Update-v1-20260827-120001.zip.sha256"
+          $RemainingCommittedItem = Join-Path $CommittedCrashQuarantine `
+            "item-000001"
+          Write-TestText $RemainingCommittedItem "committed-item-to-purge"
+          $CommittedCrashJournal = [ordered]@{
+            schema_version = 2
+            transaction_id = $CommittedCrashId
+            purpose = "deep-cleanup"
+            state = "committed"
+            install_root = $Install
+            entries = @(
+              [ordered]@{
+                item_name = "item-000000"
+                quarantine_item = "item-000000"
+                original_path = $AlreadyPurgedDownload
+                containment_root = $DownloadsRoot
+                kind = "file"
+                original_sha256 = ("a" * 64)
+                replacement_sha256 = $null
+                state = "purged"
+              },
+              [ordered]@{
+                item_name = "item-000001"
+                quarantine_item = "item-000001"
+                original_path = $RemainingCommittedDownload
+                containment_root = $DownloadsRoot
+                kind = "file"
+                original_sha256 = (Get-TestSha256 $RemainingCommittedItem)
+                replacement_sha256 = $null
+                state = "moved"
+              }
+            )
+          }
+          $CommittedCrashMarker = Join-Path $CommittedCrashQuarantine `
+            "transaction.json"
+          Write-TestText $CommittedCrashMarker `
+            ($CommittedCrashJournal | ConvertTo-Json -Depth 8)
+          if (-not (Test-Path -LiteralPath $CommittedCrashMarker -PathType Leaf)) {
+            throw "Committed partial-purge fixture lacks its durable journal"
+          }
+
+          # All H21 baselines are gone now, so the exact same command can
+          # succeed only through the authenticated completion marker.
+          & ./installer/remove-hunyuan21-local.ps1 @RemoveArguments
+          if ($LASTEXITCODE -ne 0) { throw "Idempotent Mini-only removal failed" }
+          if (-not (Test-Path -LiteralPath $CompletionMarker -PathType Leaf)) {
+            throw "Mini completion marker is missing after backup-free rerun"
+          }
+          $RemainingH21Backups = @(
+            Get-ChildItem -LiteralPath $BackupParent -Directory |
+              Where-Object {
+                $_.Name -cmatch `
+                  '^hunyuan21(?:-rasterizer|-paint-8gb)?-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
+              }
+          )
+          if ($RemainingH21Backups.Count -ne 0) {
+            throw "H21 backups reappeared after completion-marker rerun"
+          }
+          foreach ($PurgedTransactionPath in @(
+            $CommittedCrashQuarantine,
+            $AlreadyPurgedDownload,
+            $RemainingCommittedDownload
+          )) {
+            if (Test-Path -LiteralPath $PurgedTransactionPath) {
+              throw "Committed partial-purge recovery remains: $PurgedTransactionPath"
+            }
+          }
+          if ((Get-TestSha256 $InstalledExe) -cne $OriginalExeHash -or
+              (Get-TestSha256 $InstalledWorker) -cne $OriginalWorkerHash -or
+              (Get-TestSha256 $Hunyuan2Worker) -cne $Hunyuan2WorkerHash -or
+              (Get-TestSha256 $Hunyuan2Manifest) -cne $Hunyuan2ManifestHash) {
+            throw "Backup-free rerun changed Mini or Hunyuan2"
+          }
+          foreach ($StillProtected in @(
+            (Join-Path $Install "exports\model.glb"),
+            (Join-Path $Profile "Downloads\MujassamAI-Exports\model.glb"),
+            (Join-Path $Profile "Documents\MujassamAI-Exports\model.glb"),
+            (Join-Path $Profile "Downloads\MujassamAI-Build-UAE-test\repo.keep")
+          )) {
+            if (-not (Test-Path -LiteralPath $StillProtected -PathType Leaf)) {
+              throw "Backup-free rerun touched export/repository: $StillProtected"
+            }
+          }
+
+          # Inject a post-restore GUI failure.  The transactional restore must
+          # put both PBR shared files back byte-for-byte and must not begin
+          # DeepCleanup of the H21 engine or its large local state.
+          $RollbackRoot = Join-Path $env:RUNNER_TEMP (
+            "mujassam-h21-rollback-" + [Guid]::NewGuid().ToString("N"))
+          $RollbackInstall = Join-Path $RollbackRoot "install"
+          $RollbackLocal = Join-Path $RollbackRoot "local"
+          $RollbackProfile = Join-Path $RollbackRoot "profile"
+          $RollbackTemp = Join-Path $RollbackRoot "temp"
+          foreach ($Directory in @(
+            $RollbackInstall, $RollbackLocal, $RollbackProfile, $RollbackTemp
+          )) {
+            [IO.Directory]::CreateDirectory($Directory) | Out-Null
+          }
+
+          $RollbackPython = Join-Path $RollbackInstall "rt\python.exe"
+          [IO.Directory]::CreateDirectory(
+            [IO.Path]::GetDirectoryName($RollbackPython)) | Out-Null
+          [IO.File]::Copy($PortablePython, $RollbackPython, $false)
+          $FailingGuiSource = Join-Path $RollbackRoot "failing-gui-stub.cs"
+          $FailingMiniExe = Join-Path $RollbackRoot "failing-MujassamAI.exe"
+          Write-TestText $FailingGuiSource @'
+          internal static class Program
+          {
+              private static int Main(string[] args)
+              {
+                  return 23;
+              }
+          }
+          '@
+          & $Csc /nologo /target:winexe "/out:$FailingMiniExe" $FailingGuiSource
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not compile the injected failing GUI stub"
+          }
+
+          $RollbackInstalledExe = Join-Path $RollbackInstall "MujassamAI.exe"
+          [IO.File]::WriteAllBytes($RollbackInstalledExe,
+            [Text.Encoding]::ASCII.GetBytes("MZ-pbr-current-executable"))
+          $RollbackInstalledWorker = Join-Path $RollbackInstall "app\worker.py"
+          Write-TestText $RollbackInstalledWorker `
+            'ENGINE = "hunyuan3d_2_1_pbr"'
+          $RollbackH2Worker = Join-Path $RollbackInstall `
+            "app\engines\hunyuan2\hunyuan2_worker.py"
+          $RollbackH2Manifest = Join-Path $RollbackInstall `
+            "app\engines\hunyuan2\ENGINE-MANIFEST.json"
+          Write-TestText $RollbackH2Worker 'print("MJHUNYUANSELFTEST|OK|1")'
+          Write-TestText $RollbackH2Manifest '{"engine":"mini"}'
+          $RollbackH21Worker = Join-Path $RollbackInstall `
+            "app\engines\hunyuan21\hunyuan21_worker.py"
+          Write-TestText $RollbackH21Worker "pbr-engine-must-survive"
+          $RollbackStateFile = Join-Path $RollbackLocal `
+            "MujassamAI\Engines\Hunyuan3D-2.1\models\state.keep"
+          Write-TestText $RollbackStateFile "pbr-state-must-survive"
+
+          $PbrExeHashBefore = Get-TestSha256 $RollbackInstalledExe
+          $PbrWorkerHashBefore = Get-TestSha256 $RollbackInstalledWorker
+          $PbrEngineHashBefore = Get-TestSha256 $RollbackH21Worker
+          $PbrStateHashBefore = Get-TestSha256 $RollbackStateFile
+          $RollbackBackupParent = Join-Path $RollbackLocal `
+            "MujassamAI\Backups"
+          $RollbackBaseline = Join-Path $RollbackBackupParent `
+            "hunyuan21-20010101T000000Z-abcdef12"
+          [IO.Directory]::CreateDirectory($RollbackBaseline) | Out-Null
+          [IO.File]::Copy($FailingMiniExe,
+            (Join-Path $RollbackBaseline "MujassamAI.exe"), $false)
+          $RollbackMiniWorkerBackup = Join-Path $RollbackBaseline `
+            "app\worker.py"
+          Write-TestText $RollbackMiniWorkerBackup `
+            'print("MJSELFTEST|OK|3")'
+          $RollbackExeBackup = Join-Path $RollbackBaseline "MujassamAI.exe"
+          $RollbackReceipt = [ordered]@{
+            schema_version = 1
+            created_utc = "2001-01-01T00:00:00.0000000+00:00"
+            install_root = $RollbackInstall
+            update_zip = (Join-Path $RollbackProfile `
+              "Downloads\MujassamAI-Hunyuan21-PBR-Update-v1.zip")
+            update_zip_sha256 = ("1" * 64)
+            overwritten_files = @(
+              [ordered]@{
+                path = "MujassamAI.exe"
+                bytes = (Get-Item -LiteralPath $RollbackExeBackup).Length
+                sha256 = (Get-TestSha256 $RollbackExeBackup)
+                installed_sha256 = $PbrExeHashBefore
+              },
+              [ordered]@{
+                path = "app/worker.py"
+                bytes = (Get-Item -LiteralPath `
+                  $RollbackMiniWorkerBackup).Length
+                sha256 = (Get-TestSha256 $RollbackMiniWorkerBackup)
+                installed_sha256 = $PbrWorkerHashBefore
+              }
+            )
+            created_files = @(
+              [ordered]@{
+                path = "app/engines/hunyuan21/hunyuan21_worker.py"
+                installed_sha256 = $PbrEngineHashBefore
+              }
+            )
+          }
+          Write-TestText (Join-Path $RollbackBaseline "install-receipt.json") `
+            ($RollbackReceipt | ConvertTo-Json -Depth 8)
+
+          $RollbackArguments = @{
+            InstallRoot = $RollbackInstall
+            LocalApplicationDataRoot = $RollbackLocal
+            UserProfileRoot = $RollbackProfile
+            TemporaryRoot = $RollbackTemp
+            DeepCleanup = $true
+            Confirm = $false
+          }
+          $InjectedFailureObserved = $false
+          try {
+            & ./installer/remove-hunyuan21-local.ps1 @RollbackArguments
+          } catch {
+            $InjectedFailureObserved = $true
+            if ($_.Exception.Message -notmatch 'rollback') {
+              throw "Failure fixture did not report transactional rollback: $_"
+            }
+            if ($_.Exception.Message -notmatch 'exit code:\s*23') {
+              throw "Remover did not consume the waited GUI ExitCode: $_"
+            }
+            # Keep GitHub's pwsh epilogue independent of earlier native stubs.
+            $global:LASTEXITCODE = 0
+          }
+          if (-not $InjectedFailureObserved) {
+            throw "Injected post-restore GUI failure unexpectedly succeeded"
+          }
+          if ((Get-TestSha256 $RollbackInstalledExe) -cne $PbrExeHashBefore -or
+              (Get-TestSha256 $RollbackInstalledWorker) -cne `
+                $PbrWorkerHashBefore -or
+              (Get-TestSha256 $RollbackH21Worker) -cne `
+                $PbrEngineHashBefore -or
+              (Get-TestSha256 $RollbackStateFile) -cne $PbrStateHashBefore) {
+            throw "Transactional rollback did not restore the exact PBR state"
+          }
+          foreach ($RollbackPreserved in @(
+            $RollbackH21Worker,
+            $RollbackStateFile,
+            (Join-Path $RollbackBaseline "install-receipt.json")
+          )) {
+            if (-not (Test-Path -LiteralPath $RollbackPreserved -PathType Leaf)) {
+              throw "Rollback removed H21 engine/state/baseline: $RollbackPreserved"
+            }
+          }
+          $UnexpectedRollbackMarker = Join-Path $RollbackLocal `
+            "MujassamAI\mini-only-restored-v1.json"
+          if (Test-Path -LiteralPath $UnexpectedRollbackMarker) {
+            throw "Failed restore wrote a false Mini completion marker"
+          }
+          $RollbackQuarantines = @(
+            Get-ChildItem -LiteralPath $RollbackRoot -Force -Recurse -Directory |
+              Where-Object {
+                $_.Name -cmatch `
+                  '^\.MujassamAI-hy21-quarantine-[0-9a-f]{32}$'
+              }
+          )
+          if ($RollbackQuarantines.Count -ne 0) {
+            throw "Rollback left an active quarantine behind"
+          }
+          Write-Host "MJHUNYUAN21ACTIVERECOVERYSELFTEST|OK|1"
+          Write-Host "MJHUNYUAN21COMMITTEDRECOVERYSELFTEST|OK|1"
+          Write-Host "MJHUNYUAN21PBRBASEREJECTSELFTEST|OK|1"
+          Write-Host "MJHUNYUAN21SETUPPROTECTSELFTEST|OK|1"
+          Write-Host "MJHUNYUAN21ROLLBACKSELFTEST|OK|1"
+          Write-Host "MJHUNYUAN21DEEPSELFTEST|OK|2"
+          Write-Host "MJHUNYUAN21REMOVESELFTEST|OK|2"
 
       - name: Compile the repository-owned WinForms adapter
         shell: pwsh
