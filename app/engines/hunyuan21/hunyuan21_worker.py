@@ -2140,6 +2140,264 @@ def _validate_native_pbr_maps(state: dict[str, Any]) -> dict[str, list[int]]:
     return records
 
 
+def _collect_cuda(torch_module: Any) -> None:
+    """Release unreachable stage objects without changing the quality profile."""
+
+    gc.collect()
+    if torch_module.cuda.is_available():
+        torch_module.cuda.empty_cache()
+
+
+def _streaming_projection_is_redundant(painted_sum: Any, view_sum: Any) -> Any:
+    """Keep Tencent's strict fast-bake redundancy test in one audited place."""
+
+    return painted_sum / view_sum > 0.99
+
+
+class _LowVramSuperResolutionOneShot:
+    """Keep RealESRGAN off CUDA until diffusion has released its large models."""
+
+    def __init__(
+        self, super_model: Any, torch_module: Any, *, emit_progress: bool = True
+    ) -> None:
+        upsampler = getattr(super_model, "upsampler", None)
+        model = getattr(upsampler, "model", None)
+        if upsampler is None or model is None or not callable(getattr(model, "to", None)):
+            raise EngineError(
+                "paint-runtime", "The bundled RealESRGAN runtime has an unexpected layout"
+            )
+        self._super_model = super_model
+        self._upsampler = upsampler
+        self._model = model
+        self._torch = torch_module
+        self._emit_progress = emit_progress
+        self._expected_calls = 0
+        self._completed_calls = 0
+        self._on_cuda = True
+        self._released = False
+
+    def offload_for_diffusion(self) -> None:
+        if self._released:
+            raise EngineError("paint-runtime", "RealESRGAN was already released")
+        if self._emit_progress:
+            _progress(65, "Moving RealESRGAN off CUDA before 12-view diffusion")
+        self._model.to("cpu")
+        self._upsampler.device = self._torch.device("cpu")
+        self._on_cuda = False
+        _collect_cuda(self._torch)
+
+    def restore_for_enhancement(self, expected_calls: int) -> None:
+        if self._released or expected_calls <= 0:
+            raise EngineError("paint-runtime", "Paint returned no PBR views to enhance")
+        self._expected_calls = int(expected_calls)
+        self._completed_calls = 0
+        self._model.to("cuda")
+        self._upsampler.device = self._torch.device("cuda")
+        self._on_cuda = True
+        if self._emit_progress:
+            _progress(70, "Diffusion models released; restoring RealESRGAN for PBR views")
+
+    def _release_before_bake(self) -> None:
+        if self._released:
+            return
+        # Break every owner link before collecting.  The upstream pipeline never
+        # uses RealESRGAN after the last enhanced albedo/MR view.
+        self._upsampler.model = None
+        self._model = None
+        self._super_model = None
+        self._upsampler = None
+        self._on_cuda = False
+        self._released = True
+        _collect_cuda(self._torch)
+        if self._emit_progress:
+            _progress(74, "PBR views enhanced; releasing RealESRGAN before the 4K bake")
+
+    def __call__(self, image: Any) -> Any:
+        if self._released or not self._on_cuda or self._super_model is None:
+            raise EngineError("paint-runtime", "RealESRGAN is unavailable for enhancement")
+        result = self._super_model(image)
+        self._completed_calls += 1
+        if self._completed_calls > self._expected_calls:
+            raise EngineError("paint-runtime", "Paint requested unexpected extra enhancements")
+        if self._emit_progress:
+            percent = 70 + min(
+                3,
+                (3 * self._completed_calls) // max(1, self._expected_calls),
+            )
+            _progress(
+                percent,
+                f"Enhancing PBR view {self._completed_calls}/{self._expected_calls}",
+            )
+        if self._completed_calls == self._expected_calls:
+            self._release_before_bake()
+        return result
+
+
+class _LowVramMultiviewOneShot:
+    """Run diffusion once, then discard UNet/VAE/DINO before RealESRGAN."""
+
+    def __init__(
+        self,
+        multiview_model: Any,
+        super_model: _LowVramSuperResolutionOneShot,
+        torch_module: Any,
+        *,
+        emit_progress: bool = True,
+    ) -> None:
+        self._multiview_model = multiview_model
+        self._super_model = super_model
+        self._torch = torch_module
+        self._emit_progress = emit_progress
+        self._used = False
+        self._released = False
+
+    def _release_diffusion_models(self) -> None:
+        multiview_model = self._multiview_model
+        diffusion_pipeline = getattr(multiview_model, "pipeline", None)
+        if diffusion_pipeline is not None:
+            # Explicitly sever the three large CUDA owners first.  Clearing the
+            # remaining encoders and the pipeline then makes their allocations
+            # collectible before RealESRGAN is returned to CUDA.
+            for name in ("unet", "vae", "image_encoder", "text_encoder"):
+                if hasattr(diffusion_pipeline, name):
+                    setattr(diffusion_pipeline, name, None)
+            multiview_model.pipeline = None
+        if hasattr(multiview_model, "dino_v2"):
+            multiview_model.dino_v2 = None
+        self._multiview_model = None
+        self._released = True
+        _collect_cuda(self._torch)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._used or self._multiview_model is None:
+            raise EngineError("paint-runtime", "Multiview diffusion is one-shot per Paint stage")
+        self._used = True
+        self._super_model.offload_for_diffusion()
+        result = self._multiview_model(*args, **kwargs)
+        if not isinstance(result, dict):
+            raise EngineError("paint-runtime", "Paint returned an invalid PBR view collection")
+        albedo = result.get("albedo")
+        metallic_roughness = result.get("mr")
+        if (
+            not isinstance(albedo, list)
+            or not isinstance(metallic_roughness, list)
+            or not albedo
+            or len(albedo) != len(metallic_roughness)
+        ):
+            raise EngineError("paint-runtime", "Paint returned incomplete albedo/MR views")
+        if self._emit_progress:
+            _progress(69, "12-view diffusion completed; releasing UNet, VAE, and DINO")
+        self._release_diffusion_models()
+        self._super_model.restore_for_enhancement(len(albedo) + len(metallic_roughness))
+        return result
+
+
+def _install_streaming_pbr_bake(
+    view_processor: Any, torch_module: Any, *, emit_progress: bool = True
+) -> None:
+    """Bake one projection at a time with Tencent's exact merge order/math."""
+
+    bake_pass = 0
+
+    def bake_from_multiview(
+        views: Any,
+        camera_elevs: Any,
+        camera_azims: Any,
+        view_weights: Any,
+    ) -> tuple[Any, Any]:
+        nonlocal bake_pass
+        bake_pass += 1
+        texture_merge = None
+        trust_map_merge = None
+        view_count = min(
+            len(views), len(camera_elevs), len(camera_azims), len(view_weights)
+        )
+        if view_count <= 0:
+            raise EngineError("paint-runtime", "Paint supplied no views for the 4K bake")
+
+        for index, (view, camera_elev, camera_azim, weight) in enumerate(
+            zip(views, camera_elevs, camera_azims, view_weights), start=1
+        ):
+            project_texture, project_cos_map, project_boundary_map = (
+                view_processor.render.back_project(view, camera_elev, camera_azim)
+            )
+            # Preserve upstream exactly: weight first multiplies cosine raised
+            # to bake_exp, then views are considered in their selected order.
+            project_cos_map = weight * (project_cos_map**view_processor.config.bake_exp)
+            if texture_merge is None:
+                texture_merge = torch_module.zeros_like(project_texture)
+                trust_map_merge = torch_module.zeros_like(project_cos_map)
+
+            view_sum = (project_cos_map > 0).sum()
+            painted_sum = ((project_cos_map > 0) * (trust_map_merge > 0)).sum()
+            skipped = bool(
+                _streaming_projection_is_redundant(painted_sum, view_sum)
+            )
+            if not skipped:
+                texture_merge.add_(project_texture * project_cos_map)
+                trust_map_merge.add_(project_cos_map)
+
+            # Neither the unused boundary map nor an earlier 4K projection is
+            # retained; the next iteration reuses the CUDA allocator's blocks.
+            del project_texture, project_cos_map, project_boundary_map
+            if emit_progress:
+                base_percent = 74 if bake_pass == 1 else 77
+                percent = base_percent + min(3, (3 * index) // view_count)
+                suffix = " (redundant view skipped)" if skipped else ""
+                _progress(
+                    percent,
+                    f"Streaming 4K PBR bake {bake_pass}/2: view {index}/{view_count}{suffix}",
+                )
+
+        if texture_merge is None or trust_map_merge is None:
+            raise EngineError("paint-runtime", "The streaming 4K bake produced no texture")
+        texture_merge = texture_merge / torch_module.clamp(trust_map_merge, min=1e-8)
+        return texture_merge, trust_map_merge > 1e-8
+
+    view_processor.bake_from_multiview = bake_from_multiview
+
+
+def _install_low_vram_paint_runtime(
+    pipeline: Any, torch_module: Any, *, emit_progress: bool = True
+) -> None:
+    """Install runtime-only 8 GiB scheduling without changing Paint quality."""
+
+    models = getattr(pipeline, "models", None)
+    if not isinstance(models, dict):
+        raise EngineError("paint-runtime", "The Paint model registry is unavailable")
+    multiview_model = models.get("multiview_model")
+    super_model = models.get("super_model")
+    diffusion_pipeline = getattr(multiview_model, "pipeline", None)
+    if diffusion_pipeline is None:
+        raise EngineError("paint-runtime", "The multiview diffusion pipeline is unavailable")
+
+    enable_vae_slicing = getattr(diffusion_pipeline, "enable_vae_slicing", None)
+    if callable(enable_vae_slicing):
+        enable_vae_slicing()
+    else:
+        vae = getattr(diffusion_pipeline, "vae", None)
+        enable_slicing = getattr(vae, "enable_slicing", None)
+        if not callable(enable_slicing):
+            raise EngineError("paint-runtime", "The pinned Paint VAE cannot enable slicing")
+        enable_slicing()
+
+    super_wrapper = _LowVramSuperResolutionOneShot(
+        super_model, torch_module, emit_progress=emit_progress
+    )
+    models["super_model"] = super_wrapper
+    models["multiview_model"] = _LowVramMultiviewOneShot(
+        multiview_model,
+        super_wrapper,
+        torch_module,
+        emit_progress=emit_progress,
+    )
+    _install_streaming_pbr_bake(
+        pipeline.view_processor, torch_module, emit_progress=emit_progress
+    )
+    if emit_progress:
+        _progress(61, "Enabled VAE slicing and one-projection native 4K PBR baking")
+
+
 def _stage_paint(state: dict[str, Any]) -> int:
     _progress(54, "Re-verifying pinned Paint and DINO bytes immediately before load")
     model_root, dino_root = _validated_stage_model_paths(state, stage="paint")
@@ -2186,8 +2444,9 @@ def _stage_paint(state: dict[str, Any]) -> int:
     config.realesrgan_ckpt_path = str(REALESRGAN_X4)
     _progress(57, "Loading pinned Hunyuan Paint 2.1 PBR entirely from local files")
     pipeline = Hunyuan3DPaintPipeline(config)
+    _install_low_vram_paint_runtime(pipeline, torch)
     try:
-        _progress(64, "Painting 12 selected views at 768 and baking native 4K PBR maps")
+        _progress(64, "Painting 12 selected views at 768 with staged CUDA memory")
         try:
             pipeline(
                 mesh_path=state["shape_mesh"],
@@ -2560,6 +2819,340 @@ def _stage_process_result_self_test() -> bool:
     )
 
 
+def _paint_low_vram_runtime_self_test() -> bool:
+    """Exercise the CUDA ownership lifecycle with model-free stand-ins."""
+
+    import weakref
+
+    class FakeCuda:
+        def __init__(self) -> None:
+            self.collections = 0
+
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        def empty_cache(self) -> None:
+            self.collections += 1
+
+    class FakeTorch:
+        def __init__(self) -> None:
+            self.cuda = FakeCuda()
+
+        @staticmethod
+        def device(value: str) -> str:
+            return value
+
+        @staticmethod
+        def zeros_like(value: "FakeTensor") -> "FakeTensor":
+            return FakeTensor([0.0 for _ in value.values])
+
+        @staticmethod
+        def clamp(value: "FakeTensor", *, min: float) -> "FakeTensor":
+            return FakeTensor([max(item, min) for item in value.values])
+
+    class FakeScalar:
+        """Mimic tensor scalar division, including 0/0 -> NaN."""
+
+        def __init__(self, value: float) -> None:
+            self.value = float(value)
+
+        def __truediv__(self, other: Any) -> float:
+            denominator = other.value if isinstance(other, FakeScalar) else float(other)
+            if denominator == 0:
+                return float("nan")
+            return self.value / denominator
+
+    class FakeTensor:
+        """Tiny pure-stdlib tensor facade for the streaming arithmetic."""
+
+        def __init__(self, values: Any) -> None:
+            self.values = [float(value) for value in values]
+
+        def __pow__(self, exponent: float) -> "FakeTensor":
+            return FakeTensor(value**exponent for value in self.values)
+
+        def __mul__(self, other: Any) -> "FakeTensor":
+            values = other.values if isinstance(other, FakeTensor) else other
+            if isinstance(values, list):
+                return FakeTensor(
+                    left * right for left, right in zip(self.values, values)
+                )
+            return FakeTensor(value * values for value in self.values)
+
+        def __rmul__(self, other: Any) -> "FakeTensor":
+            return self * other
+
+        def __truediv__(self, other: Any) -> "FakeTensor":
+            values = other.values if isinstance(other, FakeTensor) else other
+            if isinstance(values, list):
+                return FakeTensor(
+                    left / right for left, right in zip(self.values, values)
+                )
+            return FakeTensor(value / values for value in self.values)
+
+        def __gt__(self, other: Any) -> "FakeTensor":
+            values = other.values if isinstance(other, FakeTensor) else other
+            if isinstance(values, list):
+                return FakeTensor(
+                    1.0 if left > right else 0.0
+                    for left, right in zip(self.values, values)
+                )
+            return FakeTensor(1.0 if value > values else 0.0 for value in self.values)
+
+        def sum(self) -> Any:
+            return FakeScalar(sum(self.values))
+
+        def add_(self, other: "FakeTensor") -> "FakeTensor":
+            self.values = [
+                left + right for left, right in zip(self.values, other.values)
+            ]
+            return self
+
+    class FakeModule:
+        def __init__(self) -> None:
+            self.moves: list[str] = []
+
+        def to(self, device: str) -> "FakeModule":
+            self.moves.append(str(device))
+            return self
+
+    class FakeUpsampler:
+        def __init__(self) -> None:
+            self.model = FakeModule()
+            self.device = "cuda"
+
+    class FakeSuperModel:
+        def __init__(self) -> None:
+            self.upsampler = FakeUpsampler()
+
+        @staticmethod
+        def __call__(image: Any) -> Any:
+            return image
+
+    class FakeVae:
+        def __init__(self) -> None:
+            self.slicing_enabled = False
+
+        def enable_slicing(self) -> None:
+            self.slicing_enabled = True
+
+    class FakeDiffusionPipeline:
+        def __init__(self, *, pipeline_slicing: bool = True) -> None:
+            self.unet = object()
+            self.vae = FakeVae()
+            self.image_encoder = object()
+            self.text_encoder = object()
+            self.slicing_enabled = False
+            if not pipeline_slicing:
+                self.enable_vae_slicing = None
+
+        def enable_vae_slicing(self) -> None:
+            self.slicing_enabled = True
+
+    class FakeMultiviewModel:
+        def __init__(
+            self, super_model: FakeSuperModel, diffusion: FakeDiffusionPipeline
+        ) -> None:
+            self.pipeline = diffusion
+            self.dino_v2 = object()
+            self.super_model = super_model
+            self.saw_cpu_super_model = False
+
+        def __call__(self, *_args: Any, **_kwargs: Any) -> dict[str, list[str]]:
+            self.saw_cpu_super_model = self.super_model.upsampler.device == "cpu"
+            return {"albedo": ["a0", "a1"], "mr": ["m0", "m1"]}
+
+    class FakeViewProcessor:
+        pass
+
+    class FakePaintPipeline:
+        def __init__(self, *, pipeline_slicing: bool = True) -> None:
+            super_model = FakeSuperModel()
+            diffusion = FakeDiffusionPipeline(pipeline_slicing=pipeline_slicing)
+            self.multiview = FakeMultiviewModel(super_model, diffusion)
+            self.diffusion = self.multiview.pipeline
+            self.super_model = super_model
+            self.models = {
+                "super_model": super_model,
+                "multiview_model": self.multiview,
+            }
+            self.view_processor = FakeViewProcessor()
+
+    try:
+        torch_module = FakeTorch()
+        pipeline = FakePaintPipeline()
+        diffusion = pipeline.diffusion
+        original_multiview = pipeline.multiview
+        original_super = pipeline.super_model
+        _install_low_vram_paint_runtime(
+            pipeline, torch_module, emit_progress=False
+        )
+        multiview_wrapper = pipeline.models["multiview_model"]
+        super_wrapper = pipeline.models["super_model"]
+        result = multiview_wrapper("images", "conditions")
+        if (
+            result != {"albedo": ["a0", "a1"], "mr": ["m0", "m1"]}
+            or not diffusion.slicing_enabled
+            or not original_multiview.saw_cpu_super_model
+            or original_multiview.pipeline is not None
+            or original_multiview.dino_v2 is not None
+            or any(
+                getattr(diffusion, name) is not None
+                for name in ("unet", "vae", "image_encoder", "text_encoder")
+            )
+            or original_super.upsampler.model.moves != ["cpu", "cuda"]
+        ):
+            return False
+        try:
+            multiview_wrapper("images", "conditions")
+            return False
+        except EngineError:
+            pass
+        if [super_wrapper(value) for value in ("a0", "m0", "a1", "m1")] != [
+            "a0",
+            "m0",
+            "a1",
+            "m1",
+        ]:
+            return False
+        lifecycle_valid = (
+            super_wrapper._released
+            and original_super.upsampler.model is None
+            and torch_module.cuda.collections >= 3
+            and not bool(_streaming_projection_is_redundant(99, 100))
+            and bool(_streaming_projection_is_redundant(100, 101))
+            and callable(pipeline.view_processor.bake_from_multiview)
+        )
+        try:
+            super_wrapper("extra")
+            return False
+        except EngineError:
+            pass
+        if not lifecycle_valid:
+            return False
+
+        fallback_pipeline = FakePaintPipeline(pipeline_slicing=False)
+        fallback_vae = fallback_pipeline.diffusion.vae
+        _install_low_vram_paint_runtime(
+            fallback_pipeline, FakeTorch(), emit_progress=False
+        )
+        if not fallback_vae.slicing_enabled:
+            return False
+
+        class FakeRender:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.overlapped_projection = False
+                self._previous: list[Any] = []
+                self._projections = (
+                    ([1, 2, 0, 0], [1, 1, 0, 0]),
+                    ([0, 20, 30, 0], [0, 1, 1, 0]),
+                    ([100, 100, 100, 100], [1, 1, 0, 0]),
+                    ([9, 9, 9, 9], [0, 0, 0, 0]),
+                )
+
+            def back_project(
+                self, _view: Any, _elevation: Any, _azimuth: Any
+            ) -> tuple[FakeTensor, FakeTensor, FakeTensor]:
+                if any(reference() is not None for reference in self._previous):
+                    self.overlapped_projection = True
+                texture_values, cosine_values = self._projections[self.calls]
+                self.calls += 1
+                texture = FakeTensor(texture_values)
+                cosine = FakeTensor(cosine_values)
+                boundary = FakeTensor([0, 0, 0, 0])
+                self._previous = [
+                    weakref.ref(texture),
+                    weakref.ref(cosine),
+                    weakref.ref(boundary),
+                ]
+                return texture, cosine, boundary
+
+        class FakeBakeConfig:
+            bake_exp = 2
+
+        class FakeStreamingViewProcessor:
+            def __init__(self) -> None:
+                self.render = FakeRender()
+                self.config = FakeBakeConfig()
+
+        streaming = FakeStreamingViewProcessor()
+        streaming_torch = FakeTorch()
+        _install_streaming_pbr_bake(
+            streaming, streaming_torch, emit_progress=False
+        )
+        weights = [1.0, 0.5, 1.0, 7.0]
+        texture_values = (
+            [1, 2, 0, 0],
+            [0, 20, 30, 0],
+            [100, 100, 100, 100],
+            [9, 9, 9, 9],
+        )
+        cosine_values = (
+            [1, 1, 0, 0],
+            [0, 1, 1, 0],
+            [1, 1, 0, 0],
+            [0, 0, 0, 0],
+        )
+        reference_texture = [0.0, 0.0, 0.0, 0.0]
+        reference_trust = [0.0, 0.0, 0.0, 0.0]
+        for projected, cosine, weight in zip(
+            texture_values, cosine_values, weights
+        ):
+            weighted = [
+                weight * (value**FakeBakeConfig.bake_exp) for value in cosine
+            ]
+            view_sum = sum(value > 0 for value in weighted)
+            painted_sum = sum(
+                value > 0 and trust > 0
+                for value, trust in zip(weighted, reference_trust)
+            )
+            ratio = painted_sum / view_sum if view_sum else float("nan")
+            if ratio > 0.99:
+                continue
+            reference_texture = [
+                total + color * contribution
+                for total, color, contribution in zip(
+                    reference_texture, projected, weighted
+                )
+            ]
+            reference_trust = [
+                total + contribution
+                for total, contribution in zip(reference_trust, weighted)
+            ]
+        reference_texture = [
+            value / max(trust, 1e-8)
+            for value, trust in zip(reference_texture, reference_trust)
+        ]
+        streamed_texture, streamed_mask = streaming.bake_from_multiview(
+            ["v0", "v1", "v2", "v3"],
+            [0, 1, 2, 3],
+            [10, 11, 12, 13],
+            weights,
+        )
+        return (
+            streaming.render.calls == 4
+            and not streaming.render.overlapped_projection
+            and all(
+                abs(actual - expected) < 1e-12
+                for actual, expected in zip(
+                    streamed_texture.values, reference_texture
+                )
+            )
+            and [bool(value) for value in streamed_mask.values]
+            == [trust > 1e-8 for trust in reference_trust]
+            and all(
+                abs(actual - expected) < 1e-12
+                for actual, expected in zip(
+                    streamed_texture.values, [1.0, 8.0, 30.0, 0.0]
+                )
+            )
+        )
+    except Exception:
+        return False
+
+
 def _self_test() -> int:
     x4_valid = _verify_file(REALESRGAN_X4, REALESRGAN_X4_BYTES, REALESRGAN_X4_SHA256)
     try:
@@ -2594,6 +3187,7 @@ def _self_test() -> int:
         "secret_redaction": _secret_redaction_self_test(),
         "shape_resume_identity": _shape_resume_identity_self_test(),
         "stage_error_propagation": _stage_process_result_self_test(),
+        "paint_low_vram_runtime": _paint_low_vram_runtime_self_test(),
         "download_retries": MAX_DOWNLOAD_ATTEMPTS >= 3,
         "download_stall_watchdog": DOWNLOAD_STALL_SECONDS >= 60,
         "base_worker": BASE_WORKER_PATH.is_file(),
