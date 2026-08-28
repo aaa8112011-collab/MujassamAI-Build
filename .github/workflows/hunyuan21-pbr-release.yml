@@ -229,10 +229,12 @@ jobs:
           $InstalledExe = Join-Path $Install "MujassamAI.exe"
           [IO.File]::WriteAllBytes(
             $InstalledExe, [Text.Encoding]::ASCII.GetBytes("MZ-pbr-installed"))
+          $FirstInstalledExeHash = Get-TestSha256 $InstalledExe
           $OriginalWorker = Join-Path $TestRoot "original-worker.py"
           $InstalledWorker = Join-Path $Install "app\worker.py"
           Write-TestText $OriginalWorker 'print("MJSELFTEST|OK|3")'
           Write-TestText $InstalledWorker 'ENGINE = "hunyuan3d_2_1_pbr"'
+          $FirstInstalledWorkerHash = Get-TestSha256 $InstalledWorker
           $Hunyuan2Worker = Join-Path $Install `
             "app\engines\hunyuan2\hunyuan2_worker.py"
           $Hunyuan2Manifest = Join-Path $Install `
@@ -250,12 +252,13 @@ jobs:
           $InstalledH21Payload = "pbr-worker-before-hotfix"
           Write-TestText $InstalledH21Worker $InstalledH21Payload
           $ReceiptH21WorkerHash = Get-TestSha256 $InstalledH21Worker
-          # A later hotfix hash is intentionally permitted only in this tree.
-          Write-TestText $InstalledH21Worker "pbr-worker-after-hotfix"
-          Write-TestText (Join-Path $Install `
-            "app\engines\hunyuan21\unreceipted-hotfix.keep") "remove-tree"
           $OutsideCreated = Join-Path $Install "app\quality\ultimate-only.keep"
           Write-TestText $OutsideCreated "receipt-owned"
+          $FirstOutsideCreatedHash = Get-TestSha256 $OutsideCreated
+          $AlreadyAbsentCreated = Join-Path $Install `
+            "app\quality\already-absent.keep"
+          Write-TestText $AlreadyAbsentCreated "receipt-owned-then-removed"
+          $FirstAlreadyAbsentHash = Get-TestSha256 $AlreadyAbsentCreated
 
           $BackupParent = Join-Path $Local "MujassamAI\Backups"
           $Baseline = Join-Path $BackupParent `
@@ -283,13 +286,13 @@ jobs:
                 path = "MujassamAI.exe"
                 bytes = [IO.File]::ReadAllBytes($OriginalExeBackup).Length
                 sha256 = (Get-TestSha256 $OriginalExeBackup)
-                installed_sha256 = (Get-TestSha256 $InstalledExe)
+                installed_sha256 = $FirstInstalledExeHash
               },
               [ordered]@{
                 path = "app/worker.py"
                 bytes = (Get-Item -LiteralPath $OriginalWorkerBackup).Length
                 sha256 = (Get-TestSha256 $OriginalWorkerBackup)
-                installed_sha256 = (Get-TestSha256 $InstalledWorker)
+                installed_sha256 = $FirstInstalledWorkerHash
               }
             )
             created_files = @(
@@ -299,25 +302,60 @@ jobs:
               },
               [ordered]@{
                 path = "app/quality/ultimate-only.keep"
-                installed_sha256 = (Get-TestSha256 $OutsideCreated)
+                installed_sha256 = $FirstOutsideCreatedHash
+              },
+              [ordered]@{
+                path = "app/quality/already-absent.keep"
+                installed_sha256 = $FirstAlreadyAbsentHash
               }
             )
           }
           Write-TestText (Join-Path $Baseline "install-receipt.json") `
             ($Receipt | ConvertTo-Json -Depth 8)
 
-          # A newer, otherwise valid receipt has a marker-free worker but its
-          # saved PE is PBR-tainted.  It must be rejected in favor of the older
-          # real Mini baseline rather than restored or accepted by a marker.
+          # A real second install backs up PBR build B, installs PBR build C,
+          # and records the H21 worker as overwritten instead of created.  It
+          # may prove C -> B, but its PBR backup must never become a Mini source.
           $RejectedPbrExeBackup = Join-Path $BackupParent `
             "hunyuan21-20000105T000000Z-badc0ffe"
           [IO.Directory]::CreateDirectory($RejectedPbrExeBackup) | Out-Null
           $RejectedPbrExe = Join-Path $RejectedPbrExeBackup "MujassamAI.exe"
-          [IO.File]::WriteAllBytes($RejectedPbrExe,
-            [Text.Encoding]::ASCII.GetBytes(
-              "MZ-hunyuan3d_2_1_pbr-newer-false-baseline"))
+          [IO.File]::Copy($InstalledExe, $RejectedPbrExe, $false)
           $RejectedPbrWorker = Join-Path $RejectedPbrExeBackup "app\worker.py"
-          Write-TestText $RejectedPbrWorker 'print("MJSELFTEST|OK|3")'
+          [IO.Directory]::CreateDirectory(
+            [IO.Path]::GetDirectoryName($RejectedPbrWorker)) | Out-Null
+          [IO.File]::Copy($InstalledWorker, $RejectedPbrWorker, $false)
+          $RejectedPbrH21Worker = Join-Path $RejectedPbrExeBackup `
+            "app\engines\hunyuan21\hunyuan21_worker.py"
+          [IO.Directory]::CreateDirectory(
+            [IO.Path]::GetDirectoryName($RejectedPbrH21Worker)) | Out-Null
+          [IO.File]::Copy($InstalledH21Worker, $RejectedPbrH21Worker, $false)
+          $RejectedOutsideCreated = Join-Path $RejectedPbrExeBackup `
+            "app\quality\ultimate-only.keep"
+          [IO.Directory]::CreateDirectory(
+            [IO.Path]::GetDirectoryName($RejectedOutsideCreated)) | Out-Null
+          [IO.File]::Copy($OutsideCreated, $RejectedOutsideCreated, $false)
+          $RejectedAlreadyAbsent = Join-Path $RejectedPbrExeBackup `
+            "app\quality\already-absent.keep"
+          [IO.File]::Copy(
+            $AlreadyAbsentCreated, $RejectedAlreadyAbsent, $false)
+
+          [IO.File]::WriteAllBytes($InstalledExe,
+            [Text.Encoding]::ASCII.GetBytes("MZ-pbr-installed-v2"))
+          Write-TestText $InstalledWorker `
+            'ENGINE = "hunyuan3d_2_1_pbr"; BUILD = 2'
+          Write-TestText $InstalledH21Worker "pbr-worker-v2"
+          Write-TestText $OutsideCreated "receipt-owned-v2"
+          Write-TestText $AlreadyAbsentCreated "receipt-owned-v2-then-removed"
+          $BridgeOnlyCreated = Join-Path $Install `
+            "app\quality\v2-only.keep"
+          Write-TestText $BridgeOnlyCreated "v2-created"
+          $SecondInstalledExeHash = Get-TestSha256 $InstalledExe
+          $SecondInstalledWorkerHash = Get-TestSha256 $InstalledWorker
+          $SecondInstalledH21WorkerHash = Get-TestSha256 $InstalledH21Worker
+          $SecondOutsideCreatedHash = Get-TestSha256 $OutsideCreated
+          $SecondAlreadyAbsentHash = Get-TestSha256 $AlreadyAbsentCreated
+          $BridgeOnlyCreatedHash = Get-TestSha256 $BridgeOnlyCreated
           $RejectedPbrReceipt = [ordered]@{
             schema_version = 1
             created_utc = "2000-01-05T00:00:00.0000000+00:00"
@@ -330,29 +368,49 @@ jobs:
                 path = "MujassamAI.exe"
                 bytes = (Get-Item -LiteralPath $RejectedPbrExe).Length
                 sha256 = (Get-TestSha256 $RejectedPbrExe)
-                installed_sha256 = (Get-TestSha256 $InstalledExe)
+                installed_sha256 = $SecondInstalledExeHash
               },
               [ordered]@{
                 path = "app/worker.py"
                 bytes = (Get-Item -LiteralPath $RejectedPbrWorker).Length
                 sha256 = (Get-TestSha256 $RejectedPbrWorker)
-                installed_sha256 = (Get-TestSha256 $InstalledWorker)
+                installed_sha256 = $SecondInstalledWorkerHash
+              },
+              [ordered]@{
+                path = "app/engines/hunyuan21/hunyuan21_worker.py"
+                bytes = (Get-Item -LiteralPath $RejectedPbrH21Worker).Length
+                sha256 = (Get-TestSha256 $RejectedPbrH21Worker)
+                installed_sha256 = $SecondInstalledH21WorkerHash
+              },
+              [ordered]@{
+                path = "app/quality/ultimate-only.keep"
+                bytes = (Get-Item -LiteralPath $RejectedOutsideCreated).Length
+                sha256 = (Get-TestSha256 $RejectedOutsideCreated)
+                installed_sha256 = $SecondOutsideCreatedHash
+              },
+              [ordered]@{
+                path = "app/quality/already-absent.keep"
+                bytes = (Get-Item -LiteralPath $RejectedAlreadyAbsent).Length
+                sha256 = (Get-TestSha256 $RejectedAlreadyAbsent)
+                installed_sha256 = $SecondAlreadyAbsentHash
               }
             )
             created_files = @(
               [ordered]@{
-                path = "app/engines/hunyuan21/hunyuan21_worker.py"
-                installed_sha256 = $ReceiptH21WorkerHash
-              },
-              [ordered]@{
-                path = "app/quality/ultimate-only.keep"
-                installed_sha256 = (Get-TestSha256 $OutsideCreated)
+                path = "app/quality/v2-only.keep"
+                installed_sha256 = $BridgeOnlyCreatedHash
               }
             )
           }
           Write-TestText (Join-Path $RejectedPbrExeBackup `
             "install-receipt.json") `
             ($RejectedPbrReceipt | ConvertTo-Json -Depth 8)
+          [IO.File]::Delete($AlreadyAbsentCreated)
+
+          # A later hotfix hash is intentionally permitted only in this tree.
+          Write-TestText $InstalledH21Worker "pbr-worker-after-hotfix"
+          Write-TestText (Join-Path $Install `
+            "app\engines\hunyuan21\unreceipted-hotfix.keep") "remove-tree"
 
           # This other later original-looking directory has no receipt.
           $RejectedLaterBackup = Join-Path $BackupParent `
@@ -435,6 +493,10 @@ jobs:
               "\stage.keep")) "remove"
           Write-TestText (Join-Path $Profile "Documents\user-folder\keep") "keep"
 
+          # Model a partial rollback: EXE/quality are still build C while the
+          # shared worker has already returned all the way to Mini A.
+          [IO.File]::Copy($OriginalWorker, $InstalledWorker, $true)
+
           # Simulate closing PowerShell after app/worker.py was atomically
           # renamed but before the journal advanced from planned -> moved.
           # Startup recovery must restore this required file before preflight.
@@ -490,6 +552,8 @@ jobs:
           foreach ($Removed in @(
             (Join-Path $Install "app\engines\hunyuan21"),
             $OutsideCreated,
+            $AlreadyAbsentCreated,
+            $BridgeOnlyCreated,
             $Baseline,
             $RejectedPbrExeBackup,
             $RejectedLaterBackup,
@@ -814,6 +878,7 @@ jobs:
           Write-Host "MJHUNYUAN21ACTIVERECOVERYSELFTEST|OK|1"
           Write-Host "MJHUNYUAN21COMMITTEDRECOVERYSELFTEST|OK|1"
           Write-Host "MJHUNYUAN21PBRBASEREJECTSELFTEST|OK|1"
+          Write-Host "MJHUNYUAN21REINSTALLCHAINSELFTEST|OK|1"
           Write-Host "MJHUNYUAN21SETUPPROTECTSELFTEST|OK|1"
           Write-Host "MJHUNYUAN21ROLLBACKSELFTEST|OK|1"
           Write-Host "MJHUNYUAN21DEEPSELFTEST|OK|2"

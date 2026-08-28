@@ -945,6 +945,21 @@ def main() -> int:
         "H21 removal must choose the latest compatible, marker-free, hash-verified Mini baseline",
     )
     require(
+        "REMOVE_HY21_REINSTALL_HASH_CHAIN" in local_remover
+        and "Get-VerifiedH21TransitionReceipt" in local_remover
+        and "Get-ChainedMiniRecoveryPlan" in local_remover
+        and "Get-NonH21TransitionMap" in local_remover
+        and "$RecoveryMap.Add($Relative, $FirstTransition)" in local_remover
+        and "$DiscoverIndex = $AnchorIndex - 1" in local_remover
+        and 'Before = "<absent>"' in local_remover
+        and '$State -ceq "<absent>"' in local_remover
+        and "$State -ceq [string]$Transition.After" in local_remover
+        and "after a partial rollback" in local_remover
+        and "installed_sha256 = $CapturedState" in local_remover
+        and "Test-H21EngineRelativePath $Relative" in local_remover,
+        "H21 removal must prove repeated installs backwards to one Mini origin",
+    )
+    require(
         "Test-AllowedH21ReceiptRelativePath" in local_remover
         and '"MujassamAI.exe", "NOTICE_THIRD_PARTY.md", "app/worker.py"'
         in local_remover
@@ -1278,6 +1293,10 @@ def main() -> int:
         and "MJHUNYUAN21ACTIVERECOVERYSELFTEST|OK|1" in workflow
         and "MJHUNYUAN21COMMITTEDRECOVERYSELFTEST|OK|1" in workflow
         and "MJHUNYUAN21PBRBASEREJECTSELFTEST|OK|1" in workflow
+        and "MJHUNYUAN21REINSTALLCHAINSELFTEST|OK|1" in workflow
+        and '"app\\quality\\already-absent.keep"' in workflow
+        and '"app\\quality\\v2-only.keep"' in workflow
+        and "shared worker has already returned all the way to Mini A" in workflow
         and "MJHUNYUAN21SETUPPROTECTSELFTEST|OK|1" in workflow
         and "MJHUNYUAN21GUIWAITSELFTEST|OK|1" in workflow
         and workflow.count("& ./installer/remove-hunyuan21-local.ps1") >= 3
