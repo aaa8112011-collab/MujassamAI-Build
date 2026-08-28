@@ -16,6 +16,7 @@ WORKER = ENGINE / "hunyuan21_worker.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "hunyuan21-pbr-release.yml"
 BUILD_SCRIPT = ROOT / "build" / "build-hunyuan21-update.ps1"
 RASTERIZER_HOTFIX = ROOT / "build" / "hotfix-hunyuan21-rasterizer.ps1"
+PAINT_8GB_HOTFIX = ROOT / "build" / "hotfix-hunyuan21-paint-8gb.ps1"
 LOCAL_BUILD_SCRIPT = ROOT / "build" / "build-hunyuan21-local.ps1"
 LOCAL_BUILD_LAUNCHER = ROOT / "build" / "Build-Hunyuan21-Local.cmd"
 LOCAL_BUILD_RECOVERY = ROOT / "build" / "resume-hunyuan21-local.ps1"
@@ -325,6 +326,60 @@ def main() -> int:
     require(
         0 <= paint_fix < paint_import and "if not apply_fix():" in worker_text,
         "Paint must apply the reviewed torchvision compatibility shim before import",
+    )
+    stage_paint = python_function_source(WORKER, "_stage_paint")
+    paint_low_vram = python_function_source(
+        WORKER, "_install_low_vram_paint_runtime"
+    )
+    streaming_bake = python_function_source(WORKER, "_install_streaming_pbr_bake")
+    require(
+        "enable_vae_slicing" in paint_low_vram
+        and "enable_slicing" in paint_low_vram
+        and "_LowVramSuperResolutionOneShot" in paint_low_vram
+        and "_LowVramMultiviewOneShot" in paint_low_vram
+        and "_install_streaming_pbr_bake(" in paint_low_vram,
+        "Paint 8GB runtime must slice VAE batches and stage GPU model lifetimes",
+    )
+    low_vram_install = stage_paint.find("_install_low_vram_paint_runtime(")
+    paint_execute = stage_paint.find("pipeline(", low_vram_install)
+    require(
+        0 <= low_vram_install < paint_execute
+        and "Painting 12 selected views at 768" in stage_paint,
+        "Paint low-VRAM scheduling must be installed before fixed-quality execution",
+    )
+    require(
+        "view_processor.render.back_project(" in streaming_bake
+        and "weight * (project_cos_map**view_processor.config.bake_exp)"
+        in streaming_bake
+        and "_streaming_projection_is_redundant(painted_sum, view_sum)"
+        in streaming_bake
+        and "texture_merge.add_(project_texture * project_cos_map)"
+        in streaming_bake
+        and "trust_map_merge.add_(project_cos_map)" in streaming_bake
+        and "del project_texture, project_cos_map, project_boundary_map"
+        in streaming_bake
+        and "project_textures" not in streaming_bake
+        and "project_boundary_maps" not in streaming_bake,
+        "Native 4K bake must preserve Tencent merge order while retaining one projection",
+    )
+    require(
+        "def _paint_low_vram_runtime_self_test()" in worker_text
+        and '"paint_low_vram_runtime": _paint_low_vram_runtime_self_test()'
+        in worker_text
+        and constants.get("PAINT_MAX_VIEWS") == 12
+        and constants.get("PAINT_VIEW_RESOLUTION") == 768
+        and constants.get("PBR_TEXTURE_SIZE") == 4096
+        and constants.get("SHAPE_RESUME_PIPELINE_REVISION")
+        == "mujassam-hy21-shape-cleanup-v1",
+        "Paint memory scheduling must retain 12/768/4K and the existing Shape checkpoint identity",
+    )
+    low_vram_self_test = python_function_source(
+        WORKER, "_paint_low_vram_runtime_self_test"
+    )
+    require(
+        "import numpy" not in low_vram_self_test
+        and "import torch" not in low_vram_self_test,
+        "Paint low-VRAM self-test must remain runnable with the Python stdlib only",
     )
     require(
         "_SENSITIVE_PATTERN" in worker_text
@@ -689,6 +744,53 @@ def main() -> int:
             forbidden_hotfix_action not in rasterizer_hotfix,
             f"Rasterizer-only hotfix may not materialize models/full build: {forbidden_hotfix_action}",
         )
+    require(PAINT_8GB_HOTFIX.is_file(), "Paint 8GB worker hotfix is missing")
+    paint_hotfix = PAINT_8GB_HOTFIX.read_text(encoding="utf-8")
+    require(
+        "def _install_low_vram_paint_runtime(" in paint_hotfix
+        and "def _install_streaming_pbr_bake(" in paint_hotfix
+        and len(
+            re.findall(
+                r"(?m)^\s*Assert-MujassamProcessesStopped\s+\$InstallRoot\s*$",
+                paint_hotfix,
+            )
+        )
+        == 3
+        and len(
+            re.findall(
+                r"(?m)^[ \t]*Assert-MujassamProcessesStopped[ \t]+"
+                r"\$InstallRoot[ \t]*\r?\n[ \t]*\[IO\.File\]::Replace\(",
+                paint_hotfix,
+            )
+        )
+        == 2
+        and "MJPAINTWORKERSYNTAX|OK|1" in paint_hotfix
+        and "module._validate_license_acceptance()" in paint_hotfix
+        and "[IO.File]::Replace(" in paint_hotfix
+        and re.search(
+            r"Set-FileAtomically\s+`\s*\$BackupWorker\s+\$InstalledWorker\s+"
+            r"\$OriginalWorkerSha256\s+\$InstallRoot",
+            paint_hotfix,
+        )
+        is not None
+        and "--rasterizer-self-test --texture-mode native_2k" in paint_hotfix
+        and "$InstalledWorker --self-test" in paint_hotfix,
+        "Paint hotfix must atomically install, validate, and roll back one worker only",
+    )
+    for forbidden_paint_hotfix_action in (
+        "Invoke-WebRequest",
+        "snapshot_download",
+        "pip install",
+        "build_ext",
+        "dotnet build",
+        "git clone",
+        "git pull",
+    ):
+        require(
+            forbidden_paint_hotfix_action not in paint_hotfix,
+            "Paint worker hotfix may not download/build: "
+            + forbidden_paint_hotfix_action,
+        )
     require(
         '$env:MUJASSAM_HY21_LOCAL_PERSONAL_USE -ceq "1"' in build_script
         and '$UsageScope = if ($PersonalLocalUse)' in build_script
@@ -831,6 +933,17 @@ def main() -> int:
     require(
         '"build/hotfix-hunyuan21-rasterizer.ps1"' in workflow,
         "Hosted static validation must parse the targeted rasterizer hotfix",
+    )
+    require(
+        '"build/hotfix-hunyuan21-paint-8gb.ps1"' in workflow,
+        "Hosted static validation must parse the Paint 8GB worker hotfix",
+    )
+    require(
+        "importlib.util.spec_from_file_location(" in workflow
+        and "worker._paint_low_vram_runtime_self_test()" in workflow
+        and "MJHUNYUAN21LOWVRAMSELFTEST|OK|1" in workflow
+        and "python -S -" in workflow,
+        "Hosted static validation must directly execute the stdlib-only Paint low-VRAM self-test",
     )
     require(
         "Compile the repository-owned WinForms adapter" in workflow
