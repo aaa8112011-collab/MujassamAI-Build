@@ -135,12 +135,21 @@ jobs:
               -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             "error_column=$($FirstError.Extent.StartColumnNumber)" | Out-File `
               -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            $ErrorDetail = @(
+              [string]$FirstError.ErrorId,
+              [string]$FirstError.Message,
+              [string]$FirstError.Extent.Text
+            ) -join "|"
+            $ErrorDetailBase64 = [Convert]::ToBase64String(
+              [Text.Encoding]::UTF8.GetBytes($ErrorDetail))
+            "error_detail_base64=$ErrorDetailBase64" | Out-File `
+              -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           } else {
             "has_error=false" | Out-File `
               -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           }
 
-      - name: PowerShell parser error at line ${{ steps.remover_syntax.outputs.error_line }}, column ${{ steps.remover_syntax.outputs.error_column }}
+      - name: Parser error L${{ steps.remover_syntax.outputs.error_line }} C${{ steps.remover_syntax.outputs.error_column }} ${{ steps.remover_syntax.outputs.error_detail_base64 }}
         if: steps.remover_syntax.outputs.has_error == 'true'
         shell: pwsh
         run: throw "Mini-only removal script has invalid PowerShell syntax"
