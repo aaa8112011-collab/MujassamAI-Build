@@ -509,6 +509,303 @@ function Get-TrustedMiniBaseline([string]$BackupPath, [string]$ExpectedInstallRo
     }
 }
 
+# A later reinstall receipt is not itself a Mini restore source: its saved
+# EXE/worker can already be PBR.  It can, however, prove an exact hash
+# transition from a newer installed build back to an older receipt.  This
+# parser therefore validates every non-H21 backup byte used by that lineage,
+# while the disposable/hotfixed H21 tree remains outside the hash walk.
+function Get-VerifiedH21TransitionReceipt(
+    [string]$BackupPath,
+    [string]$ExpectedInstallRoot
+) {
+    try {
+        Assert-NormalTree $BackupPath "نسخة H21 الانتقالية"
+        $ReceiptPath = Join-Path $BackupPath "install-receipt.json"
+        Assert-NoReparsePointInExistingPath $BackupPath $ReceiptPath
+        Assert-NormalFile $ReceiptPath "إيصال التثبيت الانتقالي"
+        $Receipt = Get-Content -LiteralPath $ReceiptPath -Raw |
+            ConvertFrom-Json
+        if ([int]$Receipt.schema_version -ne 1 -or
+            -not [string]::Equals(
+                (Get-NormalizedFullPath ([string]$Receipt.install_root) `
+                    "install_root داخل الإيصال الانتقالي"),
+                $ExpectedInstallRoot,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            return $null
+        }
+        $Overwritten = @($Receipt.overwritten_files)
+        $Created = @($Receipt.created_files)
+        if ($Overwritten.Count + $Created.Count -eq 0 -or
+            $Overwritten.Count + $Created.Count -gt $MaximumReceiptFiles) {
+            return $null
+        }
+        $OverwrittenMap = Get-ReceiptPathMap $Overwritten `
+            "إيصال انتقالي overwritten_files"
+        $CreatedMap = Get-ReceiptPathMap $Created `
+            "إيصال انتقالي created_files"
+        foreach ($Path in $OverwrittenMap.Keys) {
+            if ($CreatedMap.ContainsKey($Path)) {
+                return $null
+            }
+        }
+        if (-not $OverwrittenMap.ContainsKey($MiniExecutableRelative) -or
+            -not $OverwrittenMap.ContainsKey($MiniWorkerRelative)) {
+            return $null
+        }
+        $H21WorkerWasOverwritten = $OverwrittenMap.ContainsKey(
+            $H21WorkerRelative)
+        $H21WorkerWasCreated = $CreatedMap.ContainsKey($H21WorkerRelative)
+        if ($H21WorkerWasOverwritten -eq $H21WorkerWasCreated) {
+            return $null
+        }
+
+        foreach ($Entry in $Overwritten) {
+            $Relative = ([string]$Entry.path).Replace('\', '/')
+            $ExpectedHash = [string]$Entry.sha256
+            $InstalledHash = [string]$Entry.installed_sha256
+            if ($ExpectedHash -notmatch '^[0-9a-f]{64}$' -or
+                $InstalledHash -notmatch '^[0-9a-f]{64}$' -or
+                [Int64]$Entry.bytes -lt 0) {
+                return $null
+            }
+            if (Test-H21EngineRelativePath $Relative) {
+                continue
+            }
+            $BackupFile = Get-ContainedPath $BackupPath $Relative
+            Assert-NoReparsePointInExistingPath $BackupPath $BackupFile
+            Assert-NormalFile $BackupFile "ملف انتقال H21 الاحتياطي"
+            if ((Get-Item -LiteralPath $BackupFile).Length -ne
+                    [Int64]$Entry.bytes -or
+                (Get-Sha256 $BackupFile) -cne $ExpectedHash) {
+                return $null
+            }
+        }
+        foreach ($Entry in $Created) {
+            if ([string]$Entry.installed_sha256 -notmatch '^[0-9a-f]{64}$') {
+                return $null
+            }
+        }
+
+        $BackupExecutable = Get-ContainedPath `
+            $BackupPath $MiniExecutableRelative
+        $BackupWorker = Get-ContainedPath $BackupPath $MiniWorkerRelative
+        $IsMiniOrigin = $H21WorkerWasCreated -and
+            -not $H21WorkerWasOverwritten -and
+            (Test-MarkerFreeMiniExecutable $BackupExecutable) -and
+            (Test-MarkerFreeMiniWorker $BackupWorker)
+        return [pscustomobject]@{
+            Path = $BackupPath
+            Receipt = $Receipt
+            Overwritten = $Overwritten
+            Created = $Created
+            OverwrittenMap = $OverwrittenMap
+            CreatedMap = $CreatedMap
+            IsMiniOrigin = $IsMiniOrigin
+        }
+    } catch {
+        Write-Verbose (
+            "استبعاد إيصال H21 انتقالي غير موثوق $BackupPath`: " +
+            $_.Exception.Message
+        )
+        return $null
+    }
+}
+
+function Get-NonH21TransitionMap([object]$ReceiptRecord) {
+    $Map = [Collections.Generic.Dictionary[string, object]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    foreach ($Entry in @($ReceiptRecord.Overwritten)) {
+        $Relative = ([string]$Entry.path).Replace('\', '/')
+        if (Test-H21EngineRelativePath $Relative) {
+            continue
+        }
+        $Map.Add($Relative, [pscustomobject]@{
+            Entry = $Entry
+            Before = [string]$Entry.sha256
+            After = [string]$Entry.installed_sha256
+            WasCreated = $false
+        })
+    }
+    foreach ($Entry in @($ReceiptRecord.Created)) {
+        $Relative = ([string]$Entry.path).Replace('\', '/')
+        if (Test-H21EngineRelativePath $Relative) {
+            continue
+        }
+        $Map.Add($Relative, [pscustomobject]@{
+            Entry = $Entry
+            Before = "<absent>"
+            After = [string]$Entry.installed_sha256
+            WasCreated = $true
+        })
+    }
+    return ,$Map
+}
+
+function Get-CurrentTransitionState(
+    [string]$InstallRoot,
+    [string]$Relative
+) {
+    $Destination = Get-ContainedPath $InstallRoot $Relative
+    Assert-NoReparsePointInExistingPath $InstallRoot $Destination
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        return "<absent>"
+    }
+    Assert-NormalFile $Destination "ملف H21 الحالي في سلسلة الاسترجاع"
+    return (Get-Sha256 $Destination)
+}
+
+# REMOVE_HY21_REINSTALL_HASH_CHAIN: recover only when every current non-H21
+# byte can be walked backwards through the exact ordered receipts to one
+# marker-free Mini origin.  PBR receipts are bridges only and are never run or
+# restored.  The returned entries retain the origin backup hashes but pin
+# installed_sha256 to the exact state captured before any mutation, allowing
+# all existing preflight/race/rollback checks to remain fail-closed.
+function Get-ChainedMiniRecoveryPlan(
+    [object[]]$TransitionReceipts,
+    [string]$InstallRoot
+) {
+    for ($AnchorIndex = 0;
+        $AnchorIndex -lt $TransitionReceipts.Count;
+        $AnchorIndex++) {
+        $Anchor = $TransitionReceipts[$AnchorIndex]
+        if (-not [bool]$Anchor.IsMiniOrigin) {
+            continue
+        }
+        $AnchorMap = Get-NonH21TransitionMap $Anchor
+        if (-not $AnchorMap.ContainsKey($MiniExecutableRelative) -or
+            -not $AnchorMap.ContainsKey($MiniWorkerRelative)) {
+            continue
+        }
+        $RecoveryMap = [Collections.Generic.Dictionary[string, object]]::new(
+            [StringComparer]::OrdinalIgnoreCase)
+        foreach ($Relative in $AnchorMap.Keys) {
+            $RecoveryMap.Add($Relative, $AnchorMap[$Relative])
+        }
+        $Compatible = $true
+        # Discover paths introduced only by a later package from oldest to
+        # newest.  Such a path is removable only when its first receipt proves
+        # that it did not exist beforehand; an overwritten extra could be user
+        # data and rejects this Mini origin.
+        for ($DiscoverIndex = $AnchorIndex - 1;
+            $DiscoverIndex -ge 0 -and $Compatible;
+            $DiscoverIndex--) {
+            $DiscoverMap = Get-NonH21TransitionMap `
+                $TransitionReceipts[$DiscoverIndex]
+            foreach ($Relative in $DiscoverMap.Keys) {
+                if ($RecoveryMap.ContainsKey($Relative)) {
+                    continue
+                }
+                $FirstTransition = $DiscoverMap[$Relative]
+                if (-not [bool]$FirstTransition.WasCreated) {
+                    $Compatible = $false
+                    break
+                }
+                $RecoveryMap.Add($Relative, $FirstTransition)
+            }
+        }
+        if (-not $Compatible) {
+            continue
+        }
+        $Captured = [Collections.Generic.Dictionary[string, string]]::new(
+            [StringComparer]::OrdinalIgnoreCase)
+        $Virtual = [Collections.Generic.Dictionary[string, string]]::new(
+            [StringComparer]::OrdinalIgnoreCase)
+        foreach ($Relative in $RecoveryMap.Keys) {
+            $State = Get-CurrentTransitionState $InstallRoot $Relative
+            $Captured.Add($Relative, $State)
+            $Virtual.Add($Relative, $State)
+        }
+
+        # The list is already newest-first.  Only receipts newer than the
+        # candidate Mini origin may bridge the current installation back to it.
+        for ($BridgeIndex = 0;
+            $BridgeIndex -lt $AnchorIndex -and $Compatible;
+            $BridgeIndex++) {
+            $BridgeMap = Get-NonH21TransitionMap `
+                $TransitionReceipts[$BridgeIndex]
+            foreach ($Relative in $BridgeMap.Keys) {
+                if (-not $RecoveryMap.ContainsKey($Relative)) {
+                    $Compatible = $false
+                    break
+                }
+                $Transition = $BridgeMap[$Relative]
+                $State = $Virtual[$Relative]
+                if ($State -ceq "<absent>" -and
+                    [bool]($RecoveryMap[$Relative].WasCreated)) {
+                    # The target for a receipt-created path is already clean.
+                    continue
+                }
+                if ($State -ceq [string]$Transition.After) {
+                    $Virtual[$Relative] = [string]$Transition.Before
+                }
+                # Otherwise this path may already be at an older receipt state
+                # after a partial rollback.  Leave it virtual and let the
+                # Mini-origin/absent target check below prove or reject it.
+            }
+        }
+        if (-not $Compatible) {
+            continue
+        }
+
+        foreach ($Relative in $RecoveryMap.Keys) {
+            $State = $Virtual[$Relative]
+            if ($AnchorMap.ContainsKey($Relative)) {
+                $Transition = $AnchorMap[$Relative]
+                if ($State -ceq [string]$Transition.After -or
+                    $State -ceq [string]$Transition.Before) {
+                    continue
+                }
+            } elseif ($State -ceq "<absent>") {
+                continue
+            }
+            $Compatible = $false
+            break
+        }
+        if (-not $Compatible) {
+            continue
+        }
+
+        $EffectiveOverwritten = [Collections.Generic.List[object]]::new()
+        $EffectiveCreated = [Collections.Generic.List[object]]::new()
+        foreach ($Relative in $RecoveryMap.Keys) {
+            $Transition = $RecoveryMap[$Relative]
+            $Entry = $Transition.Entry
+            $CapturedState = $Captured[$Relative]
+            if (-not [bool]$Transition.WasCreated) {
+                if ($CapturedState -ceq "<absent>") {
+                    $Compatible = $false
+                    break
+                }
+                $EffectiveOverwritten.Add([pscustomobject]@{
+                    path = $Relative
+                    bytes = [Int64]$Entry.bytes
+                    sha256 = [string]$Entry.sha256
+                    installed_sha256 = $CapturedState
+                })
+            } else {
+                if ($CapturedState -ceq "<absent>") {
+                    # Already clean at capture time.  Omitting the entry means
+                    # a file that races back into existence is never deleted.
+                    continue
+                }
+                $EffectiveCreated.Add([pscustomobject]@{
+                    path = $Relative
+                    installed_sha256 = $CapturedState
+                })
+            }
+        }
+        if (-not $Compatible) {
+            continue
+        }
+        return [pscustomobject]@{
+            Baseline = $Anchor
+            Overwritten = @($EffectiveOverwritten)
+            Created = @($EffectiveCreated)
+        }
+    }
+    return $null
+}
+
 function New-QuarantineTransaction(
     [string[]]$ProtectedRoots,
     [string]$Purpose,
@@ -1702,16 +1999,43 @@ if ($TrustedBaselines.Count -ne 0) {
     $Created = @($Baseline.Created)
     $MiniExecutableOriginal = $Baseline.OverwrittenMap[$MiniExecutableRelative]
     $MiniWorkerOriginal = $Baseline.OverwrittenMap[$MiniWorkerRelative]
-} elseif (-not $CurrentWorkerIsMarkerFree -or
-    -not $CurrentExecutableIsMarkerFree -or
-    -not $HasValidCompletionMarker) {
-    throw (
-        "لا توجد نسخة Mini موثوقة ولا علامة اكتمال تطابق بصمات EXE/worker/Hunyuan2. " +
-        "لم يُحذف أو يُستبدل أي ملف."
-    )
-} else {
+} elseif ($CurrentWorkerIsMarkerFree -and
+    $CurrentExecutableIsMarkerFree -and
+    $HasValidCompletionMarker) {
     Write-Host "نسخة Mini الحالية مثبتة بعلامة اكتمال موثوقة؛ لا تحتاج rollback." `
         -ForegroundColor Green
+} else {
+    Write-Host (
+        "لم تنطبق بصمة رجوع واحدة؛ التحقق من سلسلة إعادة التثبيت " +
+        "بلا لمس الملفات..."
+    ) -ForegroundColor Cyan
+    $TransitionReceipts = [Collections.Generic.List[object]]::new()
+    foreach ($Candidate in $BaseBackupDirectories) {
+        $Transition = Get-VerifiedH21TransitionReceipt `
+            $Candidate $RootPath
+        if ($null -ne $Transition) {
+            $TransitionReceipts.Add($Transition)
+        }
+    }
+    $ChainedPlan = Get-ChainedMiniRecoveryPlan `
+        @($TransitionReceipts) $RootPath
+    if ($null -eq $ChainedPlan) {
+        throw (
+            "لا توجد نسخة Mini موثوقة ولا سلسلة بصمات إعادة تثبيت كاملة " +
+            "ولا علامة اكتمال تطابق بصمات EXE/worker/Hunyuan2. " +
+            "لم يُحذف أو يُستبدل أي ملف."
+        )
+    }
+    $Baseline = $ChainedPlan.Baseline
+    $BackupRoot = [string]$Baseline.Path
+    $Overwritten = @($ChainedPlan.Overwritten)
+    $Created = @($ChainedPlan.Created)
+    $MiniExecutableOriginal = $Baseline.OverwrittenMap[$MiniExecutableRelative]
+    $MiniWorkerOriginal = $Baseline.OverwrittenMap[$MiniWorkerRelative]
+    Write-Host (
+        "تم إثبات سلسلة إعادة التثبيت واعتماد Mini الأصلي: " +
+        $BackupRoot
+    ) -ForegroundColor Green
 }
 $AllPaths = [Collections.Generic.HashSet[string]]::new(
     [StringComparer]::OrdinalIgnoreCase)
