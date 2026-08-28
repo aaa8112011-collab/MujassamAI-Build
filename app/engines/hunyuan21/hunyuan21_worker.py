@@ -2154,6 +2154,370 @@ def _streaming_projection_is_redundant(painted_sum: Any, view_sum: Any) -> Any:
     return painted_sum / view_sum > 0.99
 
 
+def _slice_cfg_batch(value: Any, branch: int, *, branches: int = 3) -> Any:
+    """Slice tensor-like CFG inputs while preserving non-batch metadata.
+
+    Tencent's Paint pipeline concatenates the unconditional, reference, and
+    full-conditioning branches on dimension zero.  Dictionaries may contain
+    more batched tensors, while lists such as the 12 camera azimuths are shared
+    metadata and must not be sliced.
+    """
+
+    if isinstance(value, dict):
+        return {
+            key: _slice_cfg_batch(item, branch, branches=branches)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(
+            _slice_cfg_batch(item, branch, branches=branches) for item in value
+        )
+    if isinstance(value, list):
+        return [
+            _slice_cfg_batch(item, branch, branches=branches) for item in value
+        ]
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        try:
+            if len(shape) > 0 and int(shape[0]) == branches:
+                return value[branch : branch + 1]
+        except (IndexError, TypeError, ValueError):
+            pass
+    return value
+
+
+class _LowVramPaintDiffusionSchedule:
+    """Stage DINO, VAE, and UNet to minimize overlapping peak allocations.
+
+    The pinned custom pipeline creates its CUDA generator before DINO runs, so
+    this scheduler deliberately starts inside the DINO call instead of using a
+    generic Diffusers CPU-offload hook that could change the generator device.
+    The three classifier-free-guidance branches retain the official order and
+    math but execute sequentially to reduce activation memory.
+    """
+
+    _CFG_BRANCHES = 3
+    _BRANCH_CACHE_KEY = "_mujassam_cfg_branch_caches"
+    _MAIN_UNET_FF_CHUNK = 12
+
+    def __init__(
+        self,
+        multiview_model: Any,
+        torch_module: Any,
+        *,
+        emit_progress: bool = True,
+    ) -> None:
+        diffusion_pipeline = getattr(multiview_model, "pipeline", None)
+        unet = getattr(diffusion_pipeline, "unet", None)
+        vae = getattr(diffusion_pipeline, "vae", None)
+        dino = getattr(multiview_model, "dino_v2", None)
+        dual = getattr(unet, "unet_dual", None)
+        if (
+            diffusion_pipeline is None
+            or unet is None
+            or vae is None
+            or dino is None
+            or not callable(getattr(unet, "to", None))
+            or not callable(getattr(vae, "to", None))
+            or not callable(dino)
+            or not callable(getattr(diffusion_pipeline, "denoise", None))
+            or not callable(getattr(unet, "forward", None))
+            or dual is None
+            or not callable(getattr(dual, "to", None))
+            or not callable(getattr(dual, "forward", None))
+            or not callable(getattr(vae, "decode", None))
+        ):
+            raise EngineError(
+                "paint-runtime", "The pinned Paint diffusion runtime has an unexpected layout"
+            )
+        if not all(
+            bool(getattr(unet, flag, False))
+            for flag in (
+                "use_dino",
+                "use_learned_text_clip",
+                "use_dual_stream",
+                "use_ra",
+            )
+        ):
+            raise EngineError(
+                "paint-runtime", "The pinned Paint DINO/learned-text configuration changed"
+            )
+
+        self._multiview_model = multiview_model
+        self._pipeline = diffusion_pipeline
+        self._unet = unet
+        self._dual = dual
+        self._vae = vae
+        self._dino = dino
+        self._torch = torch_module
+        self._emit_progress = emit_progress
+        self._original_denoise = diffusion_pipeline.denoise
+        self._original_unet_forward = unet.forward
+        self._original_dual_forward = dual.forward
+        self._original_vae_decode = vae.decode
+        self._dino_used = False
+        self._denoise_used = False
+        self._vae_offloaded_for_unet = False
+        self._unet_offloaded_for_decode = False
+        self._dual_offloaded = False
+        self._dual_used = False
+        self._condition_cache: dict[str, Any] | None = None
+
+    def install(self) -> None:
+        # Each sequential CFG branch contains 2 PBR channels x 12 views.  Split
+        # only the main UNet feed-forward activation into two groups of 12;
+        # the reference UNet is intentionally left untouched so its cache is
+        # produced once with the exact official computation.
+        main_unet = getattr(self._unet, "unet", None)
+        modules = getattr(main_unet, "modules", None)
+        if not callable(modules):
+            raise EngineError(
+                "paint-runtime", "The pinned main Paint UNet cannot enumerate its blocks"
+            )
+        chunked_blocks = 0
+        for module in modules():
+            if module.__class__.__name__ != "Basic2p5DTransformerBlock":
+                continue
+            set_chunk = getattr(module, "set_chunk_feed_forward", None)
+            if not callable(set_chunk):
+                raise EngineError(
+                    "paint-runtime", "A pinned Paint transformer cannot enable FF chunking"
+                )
+            set_chunk(self._MAIN_UNET_FF_CHUNK, dim=0)
+            chunked_blocks += 1
+        if chunked_blocks <= 0:
+            raise EngineError(
+                "paint-runtime", "No pinned main Paint transformer blocks were found"
+            )
+        self._multiview_model.dino_v2 = self._run_dino
+        self._pipeline.denoise = self._run_denoise
+        # nn.Module.__call__ resolves ``forward`` from the instance, so these
+        # bound methods preserve every upstream call site and its arguments.
+        self._unet.forward = self._run_unet_forward
+        self._dual.forward = self._run_dual_forward
+        self._vae.decode = self._run_vae_decode
+
+    @staticmethod
+    def _move(module: Any, device: str, *, label: str) -> None:
+        mover = getattr(module, "to", None)
+        if not callable(mover):
+            raise EngineError("paint-runtime", f"{label} cannot move to {device}")
+        mover(device)
+
+    def _run_dino(self, *args: Any, **kwargs: Any) -> Any:
+        if self._dino_used or self._dino is None:
+            raise EngineError("paint-runtime", "DINO feature extraction is one-shot")
+        self._dino_used = True
+        if self._emit_progress:
+            _progress(66, "Extracting DINO features alone before loading VAE/UNet on CUDA")
+
+        # The CUDA generator was already created by upstream at this point.
+        # Offload every competing diffusion component, but keep the tiny DINO
+        # output on CUDA for the later projector.
+        for name in ("unet", "vae", "text_encoder", "image_encoder"):
+            module = getattr(self._pipeline, name, None)
+            if module is not None and callable(getattr(module, "to", None)):
+                module.to("cpu")
+        _collect_cuda(self._torch)
+
+        dino = self._dino
+        try:
+            result = dino(*args, **kwargs)
+        finally:
+            # Break both owner links even if feature extraction raises.  This
+            # prevents a failed attempt retaining the 2.3 GiB FP16 DINO model.
+            self._dino = None
+            self._multiview_model.dino_v2 = None
+            del dino
+            _collect_cuda(self._torch)
+
+        # The pinned pipeline uses learned material tokens; its text/image
+        # encoders are never consulted during inference and can remain absent.
+        for name in ("text_encoder", "image_encoder"):
+            if hasattr(self._pipeline, name):
+                setattr(self._pipeline, name, None)
+        self._move(self._vae, "cuda", label="Paint VAE")
+        if self._emit_progress:
+            _progress(67, "DINO released; encoding all 12 native 768-view conditions with VAE")
+        return result
+
+    def _run_denoise(self, *args: Any, **kwargs: Any) -> Any:
+        if self._denoise_used:
+            raise EngineError("paint-runtime", "Paint denoising is one-shot")
+        if not self._dino_used:
+            raise EngineError("paint-runtime", "DINO features must be staged before denoising")
+        self._denoise_used = True
+
+        # Keep VAE and UNet on CUDA only long enough for Diffusers to resolve
+        # its execution device and create CUDA latents.  The first UNet forward
+        # immediately sends VAE back to CPU.
+        self._move(self._unet, "cuda", label="Paint UNet")
+        self._move(self._vae, "cuda", label="Paint VAE")
+        for key in ("prompt_embeds", "negative_prompt_embeds"):
+            tensor = kwargs.get(key)
+            mover = getattr(tensor, "to", None)
+            if callable(mover):
+                kwargs[key] = mover("cuda")
+        if self._emit_progress:
+            _progress(68, "VAE encodes complete; starting sequential 3-branch UNet diffusion")
+        return self._original_denoise(*args, **kwargs)
+
+    def _run_unet_forward(
+        self,
+        sample: Any,
+        timestep: Any,
+        encoder_hidden_states: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if not self._vae_offloaded_for_unet:
+            self._move(self._vae, "cpu", label="Paint VAE")
+            self._vae_offloaded_for_unet = True
+            _collect_cuda(self._torch)
+
+        shape = getattr(sample, "shape", None)
+        try:
+            cfg_batch = int(shape[0]) if shape is not None and len(shape) else 0
+        except (IndexError, TypeError, ValueError):
+            cfg_batch = 0
+        if cfg_batch != self._CFG_BRANCHES:
+            raise EngineError(
+                "paint-runtime",
+                "Pinned Paint UNet no longer supplied exactly three CFG branches",
+            )
+
+        outer_cache = kwargs.get("cache")
+        if not isinstance(outer_cache, dict):
+            raise EngineError("paint-runtime", "Paint UNet condition cache is unavailable")
+        if self._condition_cache is None:
+            self._condition_cache = outer_cache
+        elif self._condition_cache is not outer_cache:
+            raise EngineError("paint-runtime", "Paint UNet condition cache identity changed")
+        branch_caches = outer_cache.get(self._BRANCH_CACHE_KEY)
+        if branch_caches is None:
+            branch_caches = [{} for _ in range(self._CFG_BRANCHES)]
+            outer_cache[self._BRANCH_CACHE_KEY] = branch_caches
+        if (
+            not isinstance(branch_caches, list)
+            or len(branch_caches) != self._CFG_BRANCHES
+            or not all(isinstance(item, dict) for item in branch_caches)
+        ):
+            raise EngineError("paint-runtime", "Paint CFG branch cache is invalid")
+
+        outputs = []
+        for branch in range(self._CFG_BRANCHES):
+            branch_kwargs = {
+                key: _slice_cfg_batch(value, branch, branches=self._CFG_BRANCHES)
+                for key, value in kwargs.items()
+                if key != "cache"
+            }
+            branch_kwargs["cache"] = branch_caches[branch]
+            output = self._original_unet_forward(
+                _slice_cfg_batch(sample, branch, branches=self._CFG_BRANCHES),
+                timestep,
+                _slice_cfg_batch(
+                    encoder_hidden_states, branch, branches=self._CFG_BRANCHES
+                ),
+                *(
+                    _slice_cfg_batch(value, branch, branches=self._CFG_BRANCHES)
+                    for value in args
+                ),
+                **branch_kwargs,
+            )
+            if not isinstance(output, (tuple, list)) or not output:
+                raise EngineError("paint-runtime", "Paint UNet returned an invalid result")
+            outputs.append(output)
+
+            if branch == 0:
+                if not self._dual_offloaded:
+                    raise EngineError(
+                        "paint-runtime",
+                        "Reference Paint UNet was not released before the main UNet",
+                    )
+                # These two caches depend only on the identical repeated
+                # reference/position inputs, so sharing their exact objects is
+                # equivalent to the original B=3 calculation.  Unconditional
+                # and reference branches also share zero DINO input; the full
+                # branch must compute and retain its independent DINO cache.
+                required_shared = (
+                    "condition_embed_dict",
+                    "position_voxel_indices",
+                )
+                if not all(key in branch_caches[0] for key in required_shared):
+                    raise EngineError(
+                        "paint-runtime", "Paint UNet did not create its reference caches"
+                    )
+                for target in branch_caches[1:]:
+                    for key in required_shared:
+                        target[key] = branch_caches[0][key]
+                if "dino_hidden_states_proj" not in branch_caches[0]:
+                    raise EngineError("paint-runtime", "Paint UNet did not create its DINO cache")
+                branch_caches[1]["dino_hidden_states_proj"] = branch_caches[0][
+                    "dino_hidden_states_proj"
+                ]
+
+        merged_first = self._torch.cat(
+            [output[0] for output in outputs], dim=0
+        )
+        first = outputs[0]
+        if isinstance(first, tuple):
+            merged: Any = (merged_first, *first[1:])
+        else:
+            merged = [merged_first, *first[1:]]
+
+        return merged
+
+    def _run_dual_forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Offload the reference UNet before its parent starts the main UNet."""
+
+        if self._dual_used:
+            raise EngineError("paint-runtime", "Reference Paint UNet ran more than once")
+        cross_attention = kwargs.get("cross_attention_kwargs")
+        if (
+            not isinstance(cross_attention, dict)
+            or cross_attention.get("mode") != "w"
+            or not isinstance(cross_attention.get("condition_embed_dict"), dict)
+        ):
+            raise EngineError(
+                "paint-runtime", "Reference Paint UNet cache ABI changed"
+            )
+        condition_cache = cross_attention["condition_embed_dict"]
+        self._dual_used = True
+        result = self._original_dual_forward(*args, **kwargs)
+        if (
+            cross_attention.get("condition_embed_dict") is not condition_cache
+            or not condition_cache
+        ):
+            raise EngineError(
+                "paint-runtime", "Reference Paint UNet did not populate its cache"
+            )
+        # The upstream parent uses the reference call only for attention cache
+        # side effects.  Its forward has succeeded here, so the weights can
+        # leave CUDA before control resumes at the main UNet.
+        self._move(self._dual, "cpu", label="Reference Paint UNet")
+        self._dual_offloaded = True
+        _collect_cuda(self._torch)
+        if self._emit_progress:
+            _progress(
+                68,
+                "Reference UNet cached and released before main diffusion",
+            )
+        return result
+
+    def _run_vae_decode(self, *args: Any, **kwargs: Any) -> Any:
+        if not self._unet_offloaded_for_decode:
+            self._move(self._unet, "cpu", label="Paint UNet")
+            self._unet_offloaded_for_decode = True
+            if self._condition_cache is not None:
+                self._condition_cache.clear()
+                self._condition_cache = None
+            _collect_cuda(self._torch)
+            self._move(self._vae, "cuda", label="Paint VAE")
+            if self._emit_progress:
+                _progress(69, "UNet released; decoding the 12-view PBR result with VAE")
+        return self._original_vae_decode(*args, **kwargs)
+
+
 class _LowVramSuperResolutionOneShot:
     """Keep RealESRGAN off CUDA until diffusion has released its large models."""
 
@@ -2381,6 +2745,11 @@ def _install_low_vram_paint_runtime(
             raise EngineError("paint-runtime", "The pinned Paint VAE cannot enable slicing")
         enable_slicing()
 
+    diffusion_schedule = _LowVramPaintDiffusionSchedule(
+        multiview_model, torch_module, emit_progress=emit_progress
+    )
+    diffusion_schedule.install()
+
     super_wrapper = _LowVramSuperResolutionOneShot(
         super_model, torch_module, emit_progress=emit_progress
     )
@@ -2395,7 +2764,10 @@ def _install_low_vram_paint_runtime(
         pipeline.view_processor, torch_module, emit_progress=emit_progress
     )
     if emit_progress:
-        _progress(61, "Enabled VAE slicing and one-projection native 4K PBR baking")
+        _progress(
+            61,
+            "Enabled staged DINO/VAE/UNet, sequential CFG, and native 4K streaming",
+        )
 
 
 def _stage_paint(state: dict[str, Any]) -> int:
@@ -2851,6 +3223,15 @@ def _paint_low_vram_runtime_self_test() -> bool:
         def clamp(value: "FakeTensor", *, min: float) -> "FakeTensor":
             return FakeTensor([max(item, min) for item in value.values])
 
+        @staticmethod
+        def cat(values: list["FakeBatch"], dim: int = 0) -> "FakeBatch":
+            if dim != 0:
+                raise ValueError("fake batch supports only dimension zero")
+            labels: list[str] = []
+            for value in values:
+                labels.extend(value.labels)
+            return FakeBatch(labels)
+
     class FakeScalar:
         """Mimic tensor scalar division, including 0/0 -> NaN."""
 
@@ -2909,6 +3290,24 @@ def _paint_low_vram_runtime_self_test() -> bool:
             ]
             return self
 
+    class FakeBatch:
+        """Tensor-like batch used to audit CFG slicing and concatenation."""
+
+        def __init__(self, labels: Any) -> None:
+            self.labels = [str(label) for label in labels]
+            self.shape = (len(self.labels), 1)
+            self.moves: list[str] = []
+
+        def __getitem__(self, key: Any) -> "FakeBatch":
+            selected = self.labels[key]
+            if isinstance(selected, list):
+                return FakeBatch(selected)
+            return FakeBatch([selected])
+
+        def to(self, device: str) -> "FakeBatch":
+            self.moves.append(str(device))
+            return self
+
     class FakeModule:
         def __init__(self) -> None:
             self.moves: list[str] = []
@@ -2916,6 +3315,53 @@ def _paint_low_vram_runtime_self_test() -> bool:
         def to(self, device: str) -> "FakeModule":
             self.moves.append(str(device))
             return self
+
+    class FakeDino(FakeModule):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def __call__(self, _image: Any) -> FakeBatch:
+            self.calls += 1
+            return FakeBatch(["dino"])
+
+    class Basic2p5DTransformerBlock:
+        def __init__(self) -> None:
+            self.chunk_calls: list[tuple[int, int]] = []
+
+        def set_chunk_feed_forward(self, chunk_size: int, dim: int = 0) -> None:
+            self.chunk_calls.append((int(chunk_size), int(dim)))
+
+    class FakeMainUnet(FakeModule):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = [Basic2p5DTransformerBlock() for _ in range(2)]
+
+        def modules(self) -> list[Any]:
+            return [self, *self.blocks]
+
+    class FakeReferenceUnet(FakeModule):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = Basic2p5DTransformerBlock()
+            self.calls = 0
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return self.forward(*args, **kwargs)
+
+        def forward(self, *_args: Any, **kwargs: Any) -> tuple[FakeBatch]:
+            self.calls += 1
+            cross_attention = kwargs.get("cross_attention_kwargs")
+            if not isinstance(cross_attention, dict):
+                raise RuntimeError("missing fake reference cross-attention ABI")
+            condition_embed_dict = cross_attention.get("condition_embed_dict")
+            if (
+                cross_attention.get("mode") != "w"
+                or not isinstance(condition_embed_dict, dict)
+            ):
+                raise RuntimeError("missing fake reference cache output")
+            condition_embed_dict["reference"] = "cached"
+            return (FakeBatch(["dual-output"]),)
 
     class FakeUpsampler:
         def __init__(self) -> None:
@@ -2930,38 +3376,141 @@ def _paint_low_vram_runtime_self_test() -> bool:
         def __call__(image: Any) -> Any:
             return image
 
-    class FakeVae:
+    class FakeVae(FakeModule):
         def __init__(self) -> None:
+            super().__init__()
             self.slicing_enabled = False
+            self.decode_calls = 0
 
         def enable_slicing(self) -> None:
             self.slicing_enabled = True
 
+        def decode(self, latent: Any, **_kwargs: Any) -> tuple[Any]:
+            self.decode_calls += 1
+            return (latent,)
+
+    class FakeUnet(FakeModule):
+        use_dino = True
+        use_learned_text_clip = True
+        use_dual_stream = True
+        use_ra = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.unet = FakeMainUnet()
+            self.unet_dual = FakeReferenceUnet()
+            self.calls: list[tuple[str, str, str, bool, bool]] = []
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return self.forward(*args, **kwargs)
+
+        def forward(
+            self,
+            sample: FakeBatch,
+            _timestep: Any,
+            encoder_hidden_states: FakeBatch,
+            *_args: Any,
+            **kwargs: Any,
+        ) -> tuple[FakeBatch]:
+            cache = kwargs.get("cache")
+            if not isinstance(cache, dict):
+                raise RuntimeError("missing fake branch cache")
+            ref_latents = kwargs.get("ref_latents")
+            dino_states = kwargs.get("dino_hidden_states")
+            if not isinstance(ref_latents, FakeBatch) or not isinstance(
+                dino_states, FakeBatch
+            ):
+                raise RuntimeError("missing fake batched conditions")
+            cached = "condition_embed_dict" in cache
+            if not cached:
+                condition_embed_dict: dict[str, Any] = {}
+                self.unet_dual(
+                    FakeBatch(["reference"]),
+                    cross_attention_kwargs={
+                        "mode": "w",
+                        "num_in_batch": 1,
+                        "condition_embed_dict": condition_embed_dict,
+                    },
+                )
+                cache["condition_embed_dict"] = condition_embed_dict
+            cache.setdefault("position_voxel_indices", object())
+            cache.setdefault(
+                "dino_hidden_states_proj", {"source": dino_states.labels[0]}
+            )
+            self.calls.append(
+                (
+                    sample.labels[0],
+                    encoder_hidden_states.labels[0],
+                    dino_states.labels[0],
+                    cached,
+                    bool(self.unet_dual.moves and self.unet_dual.moves[-1] == "cpu"),
+                )
+            )
+            return (FakeBatch([f"out-{sample.labels[0]}"]),)
+
     class FakeDiffusionPipeline:
         def __init__(self, *, pipeline_slicing: bool = True) -> None:
-            self.unet = object()
+            self.unet = FakeUnet()
             self.vae = FakeVae()
-            self.image_encoder = object()
-            self.text_encoder = object()
+            self.image_encoder = FakeModule()
+            self.text_encoder = FakeModule()
             self.slicing_enabled = False
+            self.noise_results: list[list[str]] = []
+            self.prompt_moves: list[str] = []
+            self.cfg_cache: dict[str, Any] = {}
+            self.cfg_branch_snapshot: list[dict[str, Any]] | None = None
             if not pipeline_slicing:
                 self.enable_vae_slicing = None
 
         def enable_vae_slicing(self) -> None:
             self.slicing_enabled = True
 
+        def denoise(self, *_args: Any, **kwargs: Any) -> dict[str, list[str]]:
+            prompt = kwargs.get("prompt_embeds")
+            if isinstance(prompt, FakeBatch):
+                self.prompt_moves = list(prompt.moves)
+            cache = self.cfg_cache
+            for _step in range(2):
+                result = self.unet(
+                    FakeBatch(["uncond", "reference", "full"]),
+                    1,
+                    FakeBatch(["text-u", "text-r", "text-f"]),
+                    ref_latents=FakeBatch(["ref-u", "ref-r", "ref-f"]),
+                    dino_hidden_states=FakeBatch(["dino-u", "dino-r", "dino-f"]),
+                    embeds_normal=FakeBatch(["normal-u", "normal-r", "normal-f"]),
+                    embeds_position=FakeBatch(["position-u", "position-r", "position-f"]),
+                    position_maps=FakeBatch(["map-u", "map-r", "map-f"]),
+                    ref_scale=FakeBatch(["scale-u", "scale-r", "scale-f"]),
+                    cache=cache,
+                    return_dict=False,
+                )
+                self.noise_results.append(result[0].labels)
+            branches = self.cfg_cache.get(
+                _LowVramPaintDiffusionSchedule._BRANCH_CACHE_KEY
+            )
+            if isinstance(branches, list):
+                self.cfg_branch_snapshot = branches
+            self.vae.decode(FakeBatch(["latent"]))
+            return {"albedo": ["a0", "a1"], "mr": ["m0", "m1"]}
+
     class FakeMultiviewModel:
         def __init__(
             self, super_model: FakeSuperModel, diffusion: FakeDiffusionPipeline
         ) -> None:
             self.pipeline = diffusion
-            self.dino_v2 = object()
+            self.dino_v2 = FakeDino()
             self.super_model = super_model
             self.saw_cpu_super_model = False
 
         def __call__(self, *_args: Any, **_kwargs: Any) -> dict[str, list[str]]:
             self.saw_cpu_super_model = self.super_model.upsampler.device == "cpu"
-            return {"albedo": ["a0", "a1"], "mr": ["m0", "m1"]}
+            dino_states = self.dino_v2("image")
+            if not isinstance(dino_states, FakeBatch):
+                raise RuntimeError("fake DINO result changed")
+            return self.pipeline.denoise(
+                prompt_embeds=FakeBatch(["prompt"]),
+                negative_prompt_embeds=FakeBatch(["negative"]),
+            )
 
     class FakeViewProcessor:
         pass
@@ -2980,11 +3529,24 @@ def _paint_low_vram_runtime_self_test() -> bool:
             self.view_processor = FakeViewProcessor()
 
     try:
+        if (
+            SHAPE_INFERENCE_STEPS,
+            PAINT_MAX_VIEWS,
+            PAINT_VIEW_RESOLUTION,
+            PBR_TEXTURE_SIZE,
+            _LowVramPaintDiffusionSchedule._MAIN_UNET_FF_CHUNK,
+        ) != (50, 12, 768, 4096, 12):
+            return False
         torch_module = FakeTorch()
         pipeline = FakePaintPipeline()
         diffusion = pipeline.diffusion
         original_multiview = pipeline.multiview
         original_super = pipeline.super_model
+        original_unet = diffusion.unet
+        original_vae = diffusion.vae
+        original_dino = original_multiview.dino_v2
+        original_text_encoder = diffusion.text_encoder
+        original_image_encoder = diffusion.image_encoder
         _install_low_vram_paint_runtime(
             pipeline, torch_module, emit_progress=False
         )
@@ -3002,8 +3564,64 @@ def _paint_low_vram_runtime_self_test() -> bool:
                 for name in ("unet", "vae", "image_encoder", "text_encoder")
             )
             or original_super.upsampler.model.moves != ["cpu", "cuda"]
+            or original_dino.calls != 1
+            or original_text_encoder.moves != ["cpu"]
+            or original_image_encoder.moves != ["cpu"]
+            or original_vae.moves != ["cpu", "cuda", "cuda", "cpu", "cuda"]
+            or original_unet.moves != ["cpu", "cuda", "cpu"]
+            or original_unet.unet_dual.moves != ["cpu"]
+            or original_unet.unet_dual.calls != 1
+            or [block.chunk_calls for block in original_unet.unet.blocks]
+            != [[(12, 0)], [(12, 0)]]
+            or original_unet.unet_dual.block.chunk_calls != []
+            or original_vae.decode_calls != 1
+            or diffusion.prompt_moves != ["cuda"]
+            or diffusion.noise_results
+            != [
+                ["out-uncond", "out-reference", "out-full"],
+                ["out-uncond", "out-reference", "out-full"],
+            ]
+            or original_unet.calls
+            != [
+                ("uncond", "text-u", "dino-u", False, True),
+                ("reference", "text-r", "dino-r", True, True),
+                ("full", "text-f", "dino-f", True, True),
+                ("uncond", "text-u", "dino-u", True, True),
+                ("reference", "text-r", "dino-r", True, True),
+                ("full", "text-f", "dino-f", True, True),
+            ]
         ):
             return False
+        branch_caches = diffusion.cfg_branch_snapshot
+        if not isinstance(branch_caches, list) or len(branch_caches) != 3:
+            return False
+        if not (
+            branch_caches[0]["condition_embed_dict"]
+            is branch_caches[1]["condition_embed_dict"]
+            is branch_caches[2]["condition_embed_dict"]
+            and branch_caches[0]["position_voxel_indices"]
+            is branch_caches[1]["position_voxel_indices"]
+            is branch_caches[2]["position_voxel_indices"]
+            and branch_caches[0]["dino_hidden_states_proj"]
+            is branch_caches[1]["dino_hidden_states_proj"]
+            and branch_caches[2]["dino_hidden_states_proj"]
+            is not branch_caches[0]["dino_hidden_states_proj"]
+            and branch_caches[2]["dino_hidden_states_proj"]["source"] == "dino-f"
+            and diffusion.cfg_cache == {}
+        ):
+            return False
+        try:
+            original_unet.unet_dual(
+                FakeBatch(["second-reference"]),
+                cross_attention_kwargs={
+                    "mode": "w",
+                    "num_in_batch": 1,
+                    "condition_embed_dict": {},
+                },
+            )
+            return False
+        except EngineError:
+            pass
         try:
             multiview_wrapper("images", "conditions")
             return False

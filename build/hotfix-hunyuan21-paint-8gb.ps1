@@ -274,7 +274,12 @@ if ((Get-Sha256 $BackupWorker) -cne $OriginalWorkerSha256) {
 $UpdatedWorkerSha256 = Get-Sha256 $UpdatedWorker
 $UpdatedWorkerText = [IO.File]::ReadAllText($UpdatedWorker)
 if (-not $UpdatedWorkerText.Contains("def _install_low_vram_paint_runtime(") -or
-    -not $UpdatedWorkerText.Contains("def _install_streaming_pbr_bake(")) {
+    -not $UpdatedWorkerText.Contains("def _install_streaming_pbr_bake(") -or
+    -not $UpdatedWorkerText.Contains("class _LowVramPaintDiffusionSchedule:") -or
+    -not $UpdatedWorkerText.Contains("_MAIN_UNET_FF_CHUNK = 12") -or
+    -not $UpdatedWorkerText.Contains('module.__class__.__name__ != "Basic2p5DTransformerBlock"') -or
+    -not $UpdatedWorkerText.Contains("set_chunk(self._MAIN_UNET_FF_CHUNK, dim=0)") -or
+    -not $UpdatedWorkerText.Contains("self._dual.forward = self._run_dual_forward")) {
     throw "المستودع لا يحتوي إصلاح Paint 8GB المطلوب؛ حدّث المستودع ثم أعد المحاولة."
 }
 $SupportsSelfTest = $UpdatedWorkerText.Contains('"--self-test"') -or `
