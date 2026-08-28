@@ -15,6 +15,7 @@ ENGINE = ROOT / "app" / "engines" / "hunyuan21"
 WORKER = ENGINE / "hunyuan21_worker.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "hunyuan21-pbr-release.yml"
 BUILD_SCRIPT = ROOT / "build" / "build-hunyuan21-update.ps1"
+RASTERIZER_HOTFIX = ROOT / "build" / "hotfix-hunyuan21-rasterizer.ps1"
 LOCAL_BUILD_SCRIPT = ROOT / "build" / "build-hunyuan21-local.ps1"
 LOCAL_BUILD_LAUNCHER = ROOT / "build" / "Build-Hunyuan21-Local.cmd"
 LOCAL_BUILD_RECOVERY = ROOT / "build" / "resume-hunyuan21-local.ps1"
@@ -91,6 +92,18 @@ def literal_constants(path: Path) -> dict[str, object]:
             except (TypeError, ValueError):
                 pass
     return values
+
+
+def python_function_source(path: Path, name: str) -> str:
+    """Return one top-level function without depending on fixed line numbers."""
+
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            require(node.end_lineno is not None, f"Could not bound {name} in {path}")
+            return "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
+    raise RuntimeError(f"Missing required function {name} in {path}")
 
 
 def main() -> int:
@@ -242,12 +255,68 @@ def main() -> int:
         and "mmap_result = probe.load(str(own_path), mmap=True)" in worker_text,
         "Checkpoint guard must neutralize mmap and use the verified open handle",
     )
-    preflight = worker_text.find('_validate_base_runtime(payload["texture_mode"])')
-    prepare = worker_text.find("image_info = _prepare_image")
-    download = worker_text.find("model_root, dino_root, downloaded = _download_models")
+    rasterizer_preflight = python_function_source(WORKER, "_rasterizer_cuda_preflight")
     require(
-        0 <= preflight < prepare < download,
-        "Exact base-runtime preflight must run before image/model setup",
+        "import custom_rasterizer_kernel" in rasterizer_preflight
+        and "custom_rasterizer_kernel.rasterize_image(" in rasterizer_preflight
+        and "torch.cuda.synchronize(" in rasterizer_preflight
+        and "dtype=torch.int32" in rasterizer_preflight
+        and "8, 8" in rasterizer_preflight,
+        "Worker preflight must execute a tiny CUDA rasterizer triangle",
+    )
+    orchestrate = python_function_source(WORKER, "_orchestrate")
+    rasterizer_call = orchestrate.find("_run_rasterizer_preflight(")
+    prepare = orchestrate.find("image_info = _prepare_image")
+    download = orchestrate.find("model_root, dino_root, downloaded = _download_models")
+    resume_restore = orchestrate.find("_restore_shape_resume(")
+    shape_stage = orchestrate.find('_run_stage("shape"')
+    resume_save = orchestrate.find("_save_shape_resume(")
+    paint_stage = orchestrate.find('_run_stage("paint"')
+    publish = orchestrate.find("staging.rename(final_dir)")
+    published_flag = orchestrate.find("published = True", publish)
+    resume_delete = orchestrate.find("_delete_shape_resume(")
+    require(
+        0 <= rasterizer_call < prepare < download < shape_stage,
+        "The isolated CUDA/runtime preflight must run before image, model, and Shape setup",
+    )
+    rasterizer_launcher = python_function_source(WORKER, "_run_rasterizer_preflight")
+    require(
+        "_run_worker_child(" in rasterizer_launcher
+        and '"--rasterizer-self-test"' in rasterizer_launcher,
+        "Rasterizer preflight must run in an isolated worker process",
+    )
+    worker_main = python_function_source(WORKER, "main")
+    rasterizer_mode = worker_main.find("if args.rasterizer_self_test:")
+    engine_gate = worker_main.find("_validate_engine_pack()", rasterizer_mode)
+    license_gate_call = worker_main.find("_validate_license_acceptance()", rasterizer_mode)
+    base_runtime = worker_main.find("_validate_base_runtime(args.texture_mode)", rasterizer_mode)
+    cuda_smoke = worker_main.find("_rasterizer_cuda_preflight()", rasterizer_mode)
+    require(
+        0 <= rasterizer_mode < engine_gate < license_gate_call < base_runtime < cuda_smoke,
+        "Rasterizer child must enforce engine, license, ABI, then CUDA smoke gates",
+    )
+    require(
+        0 <= resume_restore < shape_stage < resume_save < paint_stage,
+        "Shape resume must restore before Shape and save before Paint",
+    )
+    require(
+        0 <= publish < published_flag < resume_delete,
+        "Shape resume may be deleted only after the final asset is published",
+    )
+    worker_child = python_function_source(WORKER, "_run_worker_child")
+    require(
+        'raw.startswith("MJERROR|")' in worker_child
+        and 'raw.split("|", 2)' in worker_child
+        and "last_child_error = (child_code, child_message)" in worker_child
+        and "return StageProcessResult(code, last_child_error)" in worker_child,
+        "Stage relay must parse, sanitize, and return the child MJERROR details",
+    )
+    require(
+        "raise EngineError(*preflight_result.child_error)" in orchestrate
+        and "raise EngineError(*shape_result.child_error)" in orchestrate
+        and "raise EngineError(*paint_result.child_error)" in orchestrate
+        and "raise EngineError(*finalize_result.child_error)" in orchestrate,
+        "Parent worker must preserve specific child-stage MJERROR details",
     )
     paint_fix = worker_text.find("from utils.torchvision_fix import apply_fix")
     paint_import = worker_text.find(
@@ -468,6 +537,158 @@ def main() -> int:
         in vendor_patch,
         "Staged Paint package must exclude the unused training-only wrapper",
     )
+    rasterizer_patch = python_function_source(
+        ROOT / "build" / "patch_hunyuan21_windows.py", "patch_windows_rasterizer"
+    )
+    require(
+        '"custom_rasterizer_kernel_for_windows"' in rasterizer_patch
+        and '"rasterizer_gpu.cu"' in rasterizer_patch
+        and "int64_t maxint" in rasterizer_patch
+        and "static_cast<int64_t>(MAXINT)" in rasterizer_patch
+        and "torch::full({height, width}, maxint, INT64_options)"
+        in rasterizer_patch,
+        "Windows rasterizer patch must create z_min with signed torch::kInt64 storage",
+    )
+    require(
+        'old_accessor = "(uint64_t*)z_min.data_ptr<uint64_t>()"'
+        in rasterizer_patch
+        and "reinterpret_cast<uint64_t*>(z_min.data_ptr<int64_t>())"
+        in rasterizer_patch
+        and re.search(r'"old accessor"\s*:\s*3', rasterizer_patch) is not None
+        and re.search(r'"new accessor"\s*:\s*3', rasterizer_patch) is not None
+        and "patched_source.count(new_accessor) != 3" in rasterizer_patch,
+        "Windows rasterizer patch must replace exactly three mismatched typed pointers",
+    )
+    patch_source_tree = python_function_source(
+        ROOT / "build" / "patch_hunyuan21_windows.py", "patch_source_tree"
+    )
+    require(
+        "patch_windows_rasterizer(root)" in patch_source_tree
+        and 'choices=("source", "vendor", "rasterizer-runtime")' in vendor_patch,
+        "Rasterizer correction must apply to full and targeted runtime builds",
+    )
+    require(
+        "import custom_rasterizer_kernel" in build_script
+        and 'print("Running CUDA rasterizer triangle smoke")' in build_script
+        and "custom_rasterizer_kernel.rasterize_image(" in build_script
+        and "torch.cuda.synchronize(rasterizer_vertices.device)" in build_script
+        and 'print("CUDA rasterizer triangle smoke: OK")' in build_script,
+        "Full build must execute the real CUDA rasterizer entry point",
+    )
+    require(RASTERIZER_HOTFIX.is_file(), "Targeted rasterizer hotfix script is missing")
+    rasterizer_hotfix = RASTERIZER_HOTFIX.read_text(encoding="utf-8")
+    require(
+        "HOTFIX_GPU_MICRO_SMOKE" in rasterizer_hotfix
+        and "rasterizer.rasterize_image(" in rasterizer_hotfix
+        and "torch.cuda.synchronize()" in rasterizer_hotfix
+        and "MJRASTERHOTFIXSMOKE|OK|1" in rasterizer_hotfix,
+        "Hotfix must execute the real CUDA rasterizer entry point",
+    )
+    compiled_smoke = rasterizer_hotfix.find(
+        "Invoke-RasterizerSmoke $PortablePython $Packages $BuiltPydDirectory"
+    )
+    first_install = rasterizer_hotfix.find(
+        "Set-FileAtomically $BuiltPyd $InstalledPyd", compiled_smoke
+    )
+    installed_smoke = rasterizer_hotfix.find(
+        "--rasterizer-self-test --texture-mode native_2k", first_install
+    )
+    require(
+        0 <= compiled_smoke < first_install < installed_smoke,
+        "Hotfix must test the candidate before replacement and the installed worker after it",
+    )
+    require(
+        "HOTFIX_SAFE_REPLACE" in rasterizer_hotfix
+        and "$Parent = [IO.Path]::GetDirectoryName($Destination)"
+        in rasterizer_hotfix
+        and re.search(
+            r"\[IO\.File\]::Replace\(\s*\$Candidate,\s*\$Destination,\s*"
+            r"\$ReplacementBackup,\s*\$true\s*\)",
+            rasterizer_hotfix,
+        )
+        is not None
+        and "$Entry.Backup $Entry.Destination $Entry.Sha256" in rasterizer_hotfix
+        and "$Destination, $null" not in rasterizer_hotfix,
+        "Hotfix replacement must be atomic, explicitly backed up, and recoverable",
+    )
+    require(
+        "HOTFIX_REUSE_ACCEPTANCE" in rasterizer_hotfix
+        and "module._validate_license_acceptance()" in rasterizer_hotfix
+        and "Read-Host" not in rasterizer_hotfix
+        and "Start-Process -FilePath \"notepad.exe\"" not in rasterizer_hotfix,
+        "Hotfix must reuse the installed fail-closed acceptance record without reprompting",
+    )
+    require(
+        "$Replaced = $true" in rasterizer_hotfix
+        and "$ReplacementBackup, $Destination, $Candidate, $true"
+        in rasterizer_hotfix,
+        "Hotfix must recover internally if verification fails after File.Replace",
+    )
+    require(
+        "$Packages $SetupPy build_ext" in rasterizer_hotfix
+        and rasterizer_hotfix.count("build_ext") == 1
+        and '--build-temp $BuildTemp --build-lib $BuildLib' in rasterizer_hotfix
+        and '$env:GIT_LFS_SKIP_SMUDGE = "1"' in rasterizer_hotfix
+        and '"/LICENSE" "/hy3dpaint/custom_rasterizer/"' in rasterizer_hotfix
+        and "--filter=blob:none" in rasterizer_hotfix
+        and "model_download = $false" in rasterizer_hotfix
+        and "full_build = $false" in rasterizer_hotfix,
+        "Hotfix must fetch/build only the pinned custom rasterizer and no model data",
+    )
+    require(
+        "HOTFIX_FULL_BUILD_PYTHON" in rasterizer_hotfix
+        and "$PyLauncher -3.11" in rasterizer_hotfix
+        and '"Include\\Python.h"' in rasterizer_hotfix
+        and '"libs\\python311.lib"' in rasterizer_hotfix
+        and "sys.path[:0] = [str(portable_site), str(packages)]"
+        in rasterizer_hotfix
+        and "& $BuildPython -I -X utf8 -c $BuildDriver" in rasterizer_hotfix
+        and "& $PortablePython -I -X utf8 -c $BuildDriver"
+        not in rasterizer_hotfix
+        and "custom_rasterizer_kernel\\.cp311-win_amd64\\.pyd"
+        in rasterizer_hotfix,
+        "Hotfix must compile with full CPython headers while linking the portable ABI",
+    )
+    require(
+        "HOTFIX_GIT_TRUST" in rasterizer_hotfix
+        and '$env:GIT_NO_REPLACE_OBJECTS = "1"' in rasterizer_hotfix
+        and "$env:GIT_CONFIG_GLOBAL = $OwnedGitConfig" in rasterizer_hotfix
+        and '$env:GIT_CONFIG_NOSYSTEM = "1"' in rasterizer_hotfix
+        and "core.hooksPath=$HooksDirectory" in rasterizer_hotfix
+        and rasterizer_hotfix.count("$PreviousGit") >= 8
+        and rasterizer_hotfix.count("Remove-Item Env:GIT_") == 4,
+        "Hotfix Git source retrieval must ignore external substitutions/hooks and restore its environment",
+    )
+    require(
+        "HOTFIX_PROCESS_RECHECK" in rasterizer_hotfix
+        and rasterizer_hotfix.count(
+            "Assert-MujassamProcessesStopped $InstallRoot"
+        )
+        == 2,
+        "Hotfix must check for running Mujassam processes before build and immediately before replacement",
+    )
+    require(
+        "HOTFIX_NONFATAL_RECEIPT" in rasterizer_hotfix
+        and "HOTFIX_BEST_EFFORT_CLEANUP" in rasterizer_hotfix
+        and "Remove-OwnedTemporaryDirectory $TemporaryRoot" in rasterizer_hotfix,
+        "Optional receipt and temporary cleanup failures must not invalidate a verified installation",
+    )
+    for forbidden_hotfix_action in (
+        "snapshot_download(",
+        "hf_hub_download(",
+        ".safetensors",
+        ".ckpt",
+        ".pth",
+        "pip install",
+        "Invoke-WebRequest",
+        "build-hunyuan21-update.ps1",
+        "dotnet build",
+        "PyInstaller",
+    ):
+        require(
+            forbidden_hotfix_action not in rasterizer_hotfix,
+            f"Rasterizer-only hotfix may not materialize models/full build: {forbidden_hotfix_action}",
+        )
     require(
         '$env:MUJASSAM_HY21_LOCAL_PERSONAL_USE -ceq "1"' in build_script
         and '$UsageScope = if ($PersonalLocalUse)' in build_script
@@ -606,6 +827,10 @@ def main() -> int:
     require(
         '"build/resume-hunyuan21-local.ps1"' in workflow,
         "Hosted static validation must parse the failed-build recovery script",
+    )
+    require(
+        '"build/hotfix-hunyuan21-rasterizer.ps1"' in workflow,
+        "Hosted static validation must parse the targeted rasterizer hotfix",
     )
     require(
         "Compile the repository-owned WinForms adapter" in workflow

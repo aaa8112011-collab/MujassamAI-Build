@@ -35,6 +35,9 @@ from typing import Any
 
 ENGINE_SCHEMA_VERSION = 1
 ENGINE_MODE = "hunyuan3d_2_1_pbr"
+SHAPE_RESUME_SCHEMA_VERSION = 1
+SHAPE_RESUME_MAX_BYTES = 2 * 1024**3
+SHAPE_RESUME_PIPELINE_REVISION = "mujassam-hy21-shape-cleanup-v1"
 REQUIRED_PYTHON = (3, 11, 9)
 REQUIRED_TORCH = "2.5.1+cu124"
 REQUIRED_TORCHVISION = "0.20.1+cu124"
@@ -166,6 +169,19 @@ class EngineError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class StageProcessResult(int):
+    """An int-compatible child exit code with its last structured error."""
+
+    child_error: tuple[str, str] | None
+
+    def __new__(
+        cls, code: int, child_error: tuple[str, str] | None = None
+    ) -> "StageProcessResult":
+        value = int.__new__(cls, code)
+        value.child_error = child_error
+        return value
 
 
 def _sanitize(value: object, limit: int = 900) -> str:
@@ -387,6 +403,256 @@ def _engine_state_root() -> Path:
                 "engine-state", "The Hunyuan engine state cannot use a link or junction"
             )
     return root
+
+
+def _shape_resume_identity_from_hash(
+    prepared_image_sha256: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Describe every input that can change the completed Shape mesh."""
+
+    if not re.fullmatch(r"[0-9a-f]{64}", prepared_image_sha256):
+        raise EngineError("shape-resume", "Prepared-image hash is invalid")
+    identity: dict[str, Any] = {
+        "schema_version": SHAPE_RESUME_SCHEMA_VERSION,
+        "pipeline_revision": SHAPE_RESUME_PIPELINE_REVISION,
+        "engine_schema_version": ENGINE_SCHEMA_VERSION,
+        "engine_mode": ENGINE_MODE,
+        "source_commit": SOURCE_COMMIT,
+        "model_repository": MODEL_REPOSITORY,
+        "model_revision": MODEL_REVISION,
+        "shape_subfolder": SHAPE_SUBFOLDER,
+        "shape_vae_subfolder": SHAPE_VAE_SUBFOLDER,
+        "python_runtime": ".".join(map(str, REQUIRED_PYTHON)),
+        "torch_runtime": REQUIRED_TORCH,
+        "cuda_runtime": REQUIRED_CUDA_RUNTIME,
+        "prepared_image_sha256": prepared_image_sha256,
+        "target": payload["target"],
+        "geometry_mode": payload["geometry_mode"],
+        "seed": 42,
+        "inference_steps": SHAPE_INFERENCE_STEPS,
+        "guidance_scale": SHAPE_GUIDANCE_SCALE,
+        "octree_resolution": SHAPE_OCTREE_RESOLUTION,
+        "num_chunks": SHAPE_NUM_CHUNKS,
+        "target_ready_faces": ROBLOX_READY_FACES,
+        "max_detail_faces": ROBLOX_MASTER_FACES,
+    }
+    encoded = json.dumps(
+        identity, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return {
+        "key": hashlib.sha256(encoded).hexdigest(),
+        "identity": identity,
+    }
+
+
+def _shape_resume_identity(
+    prepared_image: Path, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if _is_reparse_point(prepared_image) or not prepared_image.is_file():
+        raise EngineError("shape-resume", "Prepared image is unsafe or missing")
+    return _shape_resume_identity_from_hash(_sha256(prepared_image), payload)
+
+
+def _shape_resume_root(*, create: bool) -> Path:
+    state_root = _engine_state_root()
+    root = state_root / "shape-resume"
+    if _is_reparse_point(root):
+        raise EngineError(
+            "shape-resume", "The Shape resume checkpoint cannot use a link or junction"
+        )
+    if root.exists():
+        if not root.is_dir():
+            raise EngineError(
+                "shape-resume", "The Shape resume checkpoint cannot use a link or junction"
+            )
+    elif create:
+        root.mkdir(mode=0o700, exist_ok=True)
+        if _is_reparse_point(root) or not root.is_dir():
+            raise EngineError("shape-resume", "Could not create a safe Shape checkpoint")
+    return root
+
+
+def _remove_shape_resume_file(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if _is_reparse_point(path) or not path.is_file():
+        raise EngineError("shape-resume", "The Shape checkpoint contains an unsafe entry")
+    path.unlink()
+
+
+def _invalidate_shape_resume(root: Path) -> None:
+    """Invalidate the commit marker first, then remove only our bounded files."""
+
+    for path in (root / "manifest.json", root / "shape.ply"):
+        _remove_shape_resume_file(path)
+    try:
+        temporary_files = tuple(root.glob(".shape-resume-*.tmp"))
+    except OSError as exc:
+        raise EngineError("shape-resume", "Could not inspect the Shape checkpoint") from exc
+    for path in temporary_files:
+        _remove_shape_resume_file(path)
+
+
+def _copy_shape_resume_payload(source: Path, temporary: Path) -> tuple[int, str]:
+    """Copy and hash one regular mesh through the same already-open handles."""
+
+    if _is_reparse_point(source) or not source.is_file():
+        raise EngineError("shape-resume", "The Shape checkpoint mesh is unsafe or missing")
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with source.open("rb") as reader:
+            source_stat = os.fstat(reader.fileno())
+            if (
+                not stat.S_ISREG(source_stat.st_mode)
+                or source_stat.st_size < 100
+                or source_stat.st_size > SHAPE_RESUME_MAX_BYTES
+            ):
+                raise EngineError(
+                    "shape-resume", "The Shape checkpoint mesh has an invalid size"
+                )
+            with temporary.open("xb") as writer:
+                for chunk in iter(lambda: reader.read(4 * 1024 * 1024), b""):
+                    total += len(chunk)
+                    if total > SHAPE_RESUME_MAX_BYTES:
+                        raise EngineError(
+                            "shape-resume", "The Shape checkpoint exceeded its 2 GiB limit"
+                        )
+                    digest.update(chunk)
+                    writer.write(chunk)
+                writer.flush()
+                os.fsync(writer.fileno())
+        if total != source_stat.st_size:
+            raise EngineError("shape-resume", "The Shape checkpoint changed while copying")
+        return total, digest.hexdigest()
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _read_shape_resume_manifest(root: Path) -> dict[str, Any]:
+    path = root / "manifest.json"
+    if _is_reparse_point(path) or not path.is_file():
+        raise ValueError("manifest is missing or unsafe")
+    size = path.stat().st_size
+    if size < 32 or size > 64 * 1024:
+        raise ValueError("manifest size is invalid")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("manifest is not an object")
+    return value
+
+
+def _save_shape_resume(
+    identity_record: dict[str, Any], shape_mesh: Path
+) -> bool:
+    """Commit the one allowed Shape checkpoint; manifest replacement is last."""
+
+    root = _shape_resume_root(create=True)
+    _invalidate_shape_resume(root)
+    token = uuid.uuid4().hex
+    shape_temporary = root / f".shape-resume-{token}.tmp"
+    manifest_temporary = root / f".shape-resume-{token}-manifest.tmp"
+    try:
+        size, digest = _copy_shape_resume_payload(shape_mesh, shape_temporary)
+        manifest = {
+            "schema_version": SHAPE_RESUME_SCHEMA_VERSION,
+            "key": identity_record["key"],
+            "identity": identity_record["identity"],
+            "shape": {
+                "name": "shape.ply",
+                "size": size,
+                "sha256": digest,
+            },
+            "saved_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        with manifest_temporary.open("x", encoding="utf-8", newline="\n") as stream:
+            json.dump(manifest, stream, ensure_ascii=True, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(shape_temporary, root / "shape.ply")
+        # The manifest is the commit marker.  A crash before this replacement
+        # leaves no valid pair; a crash after it leaves the fully hashed mesh.
+        os.replace(manifest_temporary, root / "manifest.json")
+        return True
+    finally:
+        shape_temporary.unlink(missing_ok=True)
+        manifest_temporary.unlink(missing_ok=True)
+
+
+def _restore_shape_resume(
+    identity_record: dict[str, Any], destination: Path
+) -> bool:
+    """Restore only a same-identity mesh whose size and SHA-256 still match."""
+
+    root = _shape_resume_root(create=False)
+    if not root.exists():
+        return False
+    try:
+        manifest = _read_shape_resume_manifest(root)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        _invalidate_shape_resume(root)
+        return False
+    if (
+        manifest.get("schema_version") != SHAPE_RESUME_SCHEMA_VERSION
+        or manifest.get("key") != identity_record.get("key")
+        or manifest.get("identity") != identity_record.get("identity")
+    ):
+        return False
+    shape_record = manifest.get("shape")
+    if not isinstance(shape_record, dict) or shape_record.get("name") != "shape.ply":
+        _invalidate_shape_resume(root)
+        return False
+    expected_size = shape_record.get("size")
+    expected_sha256 = shape_record.get("sha256")
+    if (
+        not isinstance(expected_size, int)
+        or expected_size < 100
+        or expected_size > SHAPE_RESUME_MAX_BYTES
+        or not isinstance(expected_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+    ):
+        _invalidate_shape_resume(root)
+        return False
+    if _is_reparse_point(destination.parent) or not destination.parent.is_dir():
+        raise EngineError("shape-resume", "The Shape restore destination is unsafe")
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        actual_size, actual_sha256 = _copy_shape_resume_payload(
+            root / "shape.ply", temporary
+        )
+        if actual_size != expected_size or actual_sha256 != expected_sha256:
+            temporary.unlink(missing_ok=True)
+            _invalidate_shape_resume(root)
+            return False
+        os.replace(temporary, destination)
+        return True
+    except (OSError, EngineError):
+        temporary.unlink(missing_ok=True)
+        _invalidate_shape_resume(root)
+        return False
+
+
+def _delete_shape_resume(identity_record: dict[str, Any]) -> None:
+    """Delete this job's committed checkpoint without deleting a newer job's."""
+
+    try:
+        root = _shape_resume_root(create=False)
+        if not root.exists():
+            return
+        manifest = _read_shape_resume_manifest(root)
+        if manifest.get("key") != identity_record.get("key"):
+            return
+        _invalidate_shape_resume(root)
+        try:
+            root.rmdir()
+        except OSError:
+            pass
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, EngineError):
+        # Publishing already succeeded.  A cleanup problem must not turn a
+        # valid final asset into a reported failure, and unsafe links are never followed.
+        return
 
 
 def _validate_license_acceptance() -> Path:
@@ -732,6 +998,55 @@ def _validate_base_runtime(texture_mode: str) -> None:
                 "texture-ai-runtime",
                 "Ultimate 8K requires the exact bundled RealESRGAN_x2plus checkpoint",
             )
+
+
+def _rasterizer_cuda_preflight() -> None:
+    """Execute Tencent's real CUDA entry point before the expensive Shape stage."""
+
+    _activate_engine_paths()
+    try:
+        import torch
+        import custom_rasterizer_kernel
+
+        vertices = torch.tensor(
+            (
+                (-0.5, -0.5, 0.0, 1.0),
+                (0.5, -0.5, 0.0, 1.0),
+                (0.0, 0.5, 0.0, 1.0),
+            ),
+            dtype=torch.float32,
+            device="cuda",
+        ).contiguous()
+        faces = torch.tensor(
+            ((0, 1, 2),), dtype=torch.int32, device="cuda"
+        ).contiguous()
+        depth = torch.empty((0,), dtype=torch.float32, device="cuda")
+        result = custom_rasterizer_kernel.rasterize_image(
+            vertices, faces, depth, 8, 8, 1e-6, 0
+        )
+        torch.cuda.synchronize()
+        if (
+            not isinstance(result, (tuple, list))
+            or len(result) != 2
+            or tuple(result[0].shape) != (8, 8)
+            or tuple(result[1].shape) != (8, 8, 3)
+            or result[0].dtype != torch.int32
+            or result[1].dtype != torch.float32
+            or not result[0].is_cuda
+            or not result[1].is_cuda
+        ):
+            raise RuntimeError("the rasterizer returned an invalid tensor contract")
+    except Exception as exc:
+        raise EngineError(
+            "paint-rasterizer-runtime",
+            "Hunyuan Paint CUDA rasterizer self-check failed before Shape: "
+            f"{_sanitize(exc, 500)}",
+        ) from exc
+    finally:
+        try:
+            del result, vertices, faces, depth
+        except UnboundLocalError:
+            pass
 
 
 def _validate_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1347,17 +1662,14 @@ def _child_environment() -> dict[str, str]:
     return environment
 
 
-def _run_stage(stage: str, state_path: Path) -> int:
+def _run_worker_child(arguments: list[str]) -> StageProcessResult:
     command = [
         sys.executable,
         "-I",
         "-X",
         "utf8",
         str(Path(__file__).resolve()),
-        "--stage",
-        stage,
-        "--state",
-        str(state_path),
+        *arguments,
     ]
     process = subprocess.Popen(
         command,
@@ -1371,12 +1683,23 @@ def _run_stage(stage: str, state_path: Path) -> int:
         bufsize=1,
     )
     assert process.stdout is not None and process.stderr is not None
+    last_child_error: tuple[str, str] | None = None
 
     def relay(stream: Any, *, error_stream: bool) -> None:
+        nonlocal last_child_error
         for line in iter(stream.readline, ""):
             raw = line.rstrip("\r\n")
-            if not error_stream and raw.startswith(
-                ("MJPROGRESS|", "MJARTIFACT|", "MJERROR|", "MJSTAGEOOM|")
+            if not error_stream and raw.startswith("MJERROR|"):
+                fields = raw.split("|", 2)
+                if len(fields) == 3:
+                    child_code = _sanitize(fields[1], 80)
+                    child_message = _sanitize(fields[2])
+                    last_child_error = (child_code, child_message)
+                    cleaned = f"MJERROR|{child_code}|{child_message}"
+                else:
+                    cleaned = _sanitize(raw, 2000)
+            elif not error_stream and raw.startswith(
+                ("MJPROGRESS|", "MJARTIFACT|", "MJSTAGEOOM|")
             ):
                 cleaned = raw[:2000]
             else:
@@ -1392,9 +1715,21 @@ def _run_stage(stage: str, state_path: Path) -> int:
     out_thread.start()
     err_thread.start()
     code = int(process.wait())
-    out_thread.join(timeout=5)
-    err_thread.join(timeout=5)
-    return code
+    out_thread.join()
+    err_thread.join()
+    return StageProcessResult(code, last_child_error)
+
+
+def _run_stage(stage: str, state_path: Path) -> StageProcessResult:
+    return _run_worker_child(
+        ["--stage", stage, "--state", str(state_path)]
+    )
+
+
+def _run_rasterizer_preflight(texture_mode: str) -> StageProcessResult:
+    return _run_worker_child(
+        ["--rasterizer-self-test", "--texture-mode", texture_mode]
+    )
 
 
 def _orchestrate(request_path: Path) -> Path:
@@ -1403,8 +1738,15 @@ def _orchestrate(request_path: Path) -> Path:
     # before the first possible network download.
     _validate_engine_pack()
     acceptance_path = _validate_license_acceptance()
-    _progress(2, "Checking the exact portable CUDA runtime before model setup")
-    _validate_base_runtime(payload["texture_mode"])
+    _progress(2, "Testing the CUDA runtime and Paint rasterizer before Shape")
+    preflight_result = _run_rasterizer_preflight(payload["texture_mode"])
+    if preflight_result != 0:
+        if preflight_result.child_error is not None:
+            raise EngineError(*preflight_result.child_error)
+        raise EngineError(
+            "paint-rasterizer-runtime",
+            "Hunyuan Paint CUDA rasterizer self-check failed before Shape",
+        )
     output_root = Path(payload["output_dir"])
     token = uuid.uuid4().hex
     staging = output_root / f".mujassam-{token}.partial"
@@ -1444,33 +1786,59 @@ def _orchestrate(request_path: Path) -> Path:
         }
         state_path = staging / "engine-state.json"
         _atomic_json(state_path, state)
-
-        shape_code = _run_stage("shape", state_path)
-        if shape_code != 0:
-            message = (
-                "Hunyuan3D 2.1 Ultimate Shape needs more available GPU/RAM at "
-                "the fixed 512/50-step quality. Close GPU programs and try again"
-                if shape_code == 42
-                else "Hunyuan3D 2.1 shape generation failed. Check the execution log"
+        resume_identity = _shape_resume_identity(
+            Path(state["prepared_image"]), payload
+        )
+        shape_reused = _restore_shape_resume(
+            resume_identity, Path(state["shape_mesh"])
+        )
+        if shape_reused:
+            _progress(
+                52,
+                "Reusing verified completed geometry; skipping 50 Shape steps",
             )
-            raise EngineError("hunyuan21-shape", message)
+        else:
+            shape_result = _run_stage("shape", state_path)
+            if shape_result != 0:
+                if shape_result.child_error is not None:
+                    raise EngineError(*shape_result.child_error)
+                message = (
+                    "Hunyuan3D 2.1 Ultimate Shape needs more available GPU/RAM at "
+                    "the fixed 512/50-step quality. Close GPU programs and try again"
+                    if shape_result == 42
+                    else "Hunyuan3D 2.1 shape generation failed. Check the execution log"
+                )
+                raise EngineError("hunyuan21-shape", message)
+            try:
+                _save_shape_resume(resume_identity, Path(state["shape_mesh"]))
+                _progress(52, "Saved verified geometry for automatic Paint retry")
+            except (OSError, EngineError) as exc:
+                _progress(
+                    52,
+                    "Geometry completed; retry checkpoint was unavailable: "
+                    f"{_sanitize(exc, 240)}",
+                )
 
-        paint_code = _run_stage("paint", state_path)
-        if paint_code != 0:
+        paint_result = _run_stage("paint", state_path)
+        if paint_result != 0:
+            if paint_result.child_error is not None:
+                raise EngineError(*paint_result.child_error)
             message = (
                 "Hunyuan3D Paint 2.1 needs more available GPU/RAM for the fixed "
                 "12-view, 768, native-4K PBR quality. No quality downgrade was applied"
-                if paint_code == 42
+                if paint_result == 42
                 else "Hunyuan3D Paint 2.1 failed. Check the execution log"
             )
             raise EngineError("hunyuan21-paint", message)
 
-        finalize_code = _run_stage("finalize", state_path)
-        if finalize_code != 0:
+        finalize_result = _run_stage("finalize", state_path)
+        if finalize_result != 0:
+            if finalize_result.child_error is not None:
+                raise EngineError(*finalize_result.child_error)
             message = (
                 "Ultimate 8K AI restoration ran out of GPU memory; no lower-quality "
                 "fallback was published"
-                if finalize_code == 42 and payload["texture_mode"] == "export_8k"
+                if finalize_result == 42 and payload["texture_mode"] == "export_8k"
                 else "PBR maps were created, but lossless GLB export failed"
             )
             raise EngineError("pbr-finalize", message)
@@ -1505,6 +1873,7 @@ def _orchestrate(request_path: Path) -> Path:
                 "dino_revision": DINO_REVISION,
                 "models_downloaded_this_run": downloaded,
                 "separate_cuda_processes": True,
+                "shape_resume_reused": shape_reused,
                 "quality_downgraded": False,
                 "shape_inference_steps": SHAPE_INFERENCE_STEPS,
                 "shape_guidance_scale": SHAPE_GUIDANCE_SCALE,
@@ -1543,6 +1912,7 @@ def _orchestrate(request_path: Path) -> Path:
             raise EngineError("output-conflict", "The final output folder already exists")
         staging.rename(final_dir)
         published = True
+        _delete_shape_resume(resume_identity)
         result = final_dir / "model.glb"
         _progress(100, "Hunyuan3D 2.1 Ultimate PBR model completed")
         _artifact(result)
@@ -2157,6 +2527,39 @@ def _secret_redaction_self_test() -> bool:
     )
 
 
+def _shape_resume_identity_self_test() -> bool:
+    payload = {
+        "target": "roblox",
+        "geometry_mode": "max_detail",
+    }
+    try:
+        first = _shape_resume_identity_from_hash("ab" * 32, payload)
+        repeated = _shape_resume_identity_from_hash("ab" * 32, dict(payload))
+        changed = _shape_resume_identity_from_hash(
+            "ab" * 32, {**payload, "geometry_mode": "original"}
+        )
+        return (
+            first == repeated
+            and first["key"] != changed["key"]
+            and first["identity"]["source_commit"] == SOURCE_COMMIT
+            and first["identity"]["model_revision"] == MODEL_REVISION
+            and first["identity"]["inference_steps"] == SHAPE_INFERENCE_STEPS
+            and first["identity"]["octree_resolution"] == SHAPE_OCTREE_RESOLUTION
+        )
+    except Exception:
+        return False
+
+
+def _stage_process_result_self_test() -> bool:
+    result = StageProcessResult(7, ("specific-code", "specific message"))
+    return (
+        isinstance(result, int)
+        and int(result) == 7
+        and result != 0
+        and result.child_error == ("specific-code", "specific message")
+    )
+
+
 def _self_test() -> int:
     x4_valid = _verify_file(REALESRGAN_X4, REALESRGAN_X4_BYTES, REALESRGAN_X4_SHA256)
     try:
@@ -2189,6 +2592,8 @@ def _self_test() -> int:
         "remote_python_excluded": not any(path.endswith(".py") for path in MODEL_REQUIRED_FILES),
         "weights_only_allowlist_guard": _weights_only_guard_self_test(),
         "secret_redaction": _secret_redaction_self_test(),
+        "shape_resume_identity": _shape_resume_identity_self_test(),
+        "stage_error_propagation": _stage_process_result_self_test(),
         "download_retries": MAX_DOWNLOAD_ATTEMPTS >= 3,
         "download_stall_watchdog": DOWNLOAD_STALL_SECONDS >= 60,
         "base_worker": BASE_WORKER_PATH.is_file(),
@@ -2214,6 +2619,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--download-revision")
     parser.add_argument("--download-dir")
+    parser.add_argument("--rasterizer-self-test", action="store_true")
+    parser.add_argument(
+        "--texture-mode", choices=("native_2k", "ai_4k", "export_8k")
+    )
     parser.add_argument("--self-test", action="store_true")
     return parser
 
@@ -2223,6 +2632,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return _self_test()
     try:
+        if args.rasterizer_self_test:
+            if not args.texture_mode:
+                raise EngineError(
+                    "usage", "--texture-mode is required with --rasterizer-self-test"
+                )
+            _validate_engine_pack()
+            _validate_license_acceptance()
+            _validate_base_runtime(args.texture_mode)
+            _rasterizer_cuda_preflight()
+            print("MJHUNYUAN21RASTERIZER|OK|1", flush=True)
+            return 0
         if args.download_repository:
             if not args.download_revision or not args.download_dir:
                 raise EngineError("usage", "Download revision and directory are required")

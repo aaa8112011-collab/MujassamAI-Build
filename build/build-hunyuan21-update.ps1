@@ -597,6 +597,57 @@ paint_source = worker_source[worker_source.index("def _stage_paint"):]
 assert paint_source.index("from utils.torchvision_fix import apply_fix") < paint_source.index("if not apply_fix()")
 assert paint_source.index("if not apply_fix()") < paint_source.index("from textureGenPipeline import")
 import custom_rasterizer
+import custom_rasterizer_kernel
+
+# Exercise the compiled Windows/CUDA path, not merely its import surface.  This
+# tiny triangle reaches rasterize_image_gpu without loading any model weights and
+# catches z-buffer ABI/type mismatches before a user spends time on Shape/Paint.
+print("Running CUDA rasterizer triangle smoke")
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is required for the Hunyuan3D-2.1 rasterizer smoke")
+rasterizer_vertices = torch.tensor(
+    [
+        [-0.75, -0.75, 0.0, 1.0],
+        [0.75, -0.75, 0.0, 1.0],
+        [0.0, 0.75, 0.0, 1.0],
+    ],
+    dtype=torch.float32,
+    device="cuda",
+)
+rasterizer_faces = torch.tensor(
+    [[0, 1, 2]], dtype=torch.int32, device=rasterizer_vertices.device
+)
+rasterizer_depth = torch.empty(
+    0, dtype=torch.float32, device=rasterizer_vertices.device
+)
+rasterizer_findices, rasterizer_barycentric = (
+    custom_rasterizer_kernel.rasterize_image(
+        rasterizer_vertices,
+        rasterizer_faces,
+        rasterizer_depth,
+        8,
+        8,
+        1e-6,
+        0,
+    )
+)
+torch.cuda.synchronize(rasterizer_vertices.device)
+assert rasterizer_findices.shape == (8, 8)
+assert rasterizer_findices.dtype == torch.int32
+assert rasterizer_barycentric.shape == (8, 8, 3)
+assert rasterizer_barycentric.dtype == torch.float32
+assert rasterizer_findices.device.type == "cuda"
+assert rasterizer_barycentric.device.type == "cuda"
+assert torch.count_nonzero(rasterizer_findices).item() > 0
+assert torch.isfinite(rasterizer_barycentric).all().item()
+del (
+    rasterizer_barycentric,
+    rasterizer_depth,
+    rasterizer_faces,
+    rasterizer_findices,
+    rasterizer_vertices,
+)
+print("CUDA rasterizer triangle smoke: OK")
 from DifferentiableRenderer import mesh_inpaint_processor
 from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
 from hy3dshape.postprocessors import DegenerateFaceRemover, FaceReducer, FloaterRemover
