@@ -639,14 +639,15 @@ function Get-TransactionQuarantineRoot(
     return $Quarantine
 }
 
-function Move-ToTransactionQuarantine(
-    [object]$Transaction,
-    [string]$Path,
-    [string]$ContainmentRoot,
-    [string]$PreferredAnchor,
-    [string]$Label,
-    [string]$ReplacementSha256 = $null
-) {
+function Move-ToTransactionQuarantine {
+    param(
+        [object]$Transaction,
+        [string]$Path,
+        [string]$ContainmentRoot,
+        [string]$PreferredAnchor,
+        [string]$Label,
+        [string]$ReplacementSha256 = $null
+    )
     if (-not (Test-Path -LiteralPath $Path)) {
         return $null
     }
@@ -711,7 +712,7 @@ function Move-ToTransactionQuarantine(
     }
     $MoveRecord.State = "moved"
     Write-TransactionJournalAtomic $Transaction $RootRecord
-    if (Test-Path -LiteralPath $PathFull -or
+    if ((Test-Path -LiteralPath $PathFull) -or
         -not (Test-Path -LiteralPath $QuarantinedPath)) {
         throw "فشل نقل $Label إلى quarantine."
     }
