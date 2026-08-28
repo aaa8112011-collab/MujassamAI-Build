@@ -46,7 +46,7 @@ jobs:
           python-version: "3.11.9"
           architecture: x64
 
-      - name: Validate repository-owned adapter without Tencent source or weights
+      - name: Compile repository-owned Python sources
         shell: pwsh
         run: |
           python -m py_compile `
@@ -55,11 +55,22 @@ jobs:
             build/patch_hunyuan21_windows.py `
             build/validate_hunyuan21_adapter.py
           if ($LASTEXITCODE -ne 0) { throw "Python compilation failed" }
+
+      - name: Validate repository-owned adapter without Tencent source or weights
+        shell: pwsh
+        run: |
           python build/validate_hunyuan21_adapter.py
           if ($LASTEXITCODE -ne 0) { throw "Adapter static validation failed" }
+
+      - name: Run base worker self-test
+        shell: pwsh
+        run: |
           python app/worker.py --self-test
           if ($LASTEXITCODE -ne 0) { throw "Base worker self-test failed" }
 
+      - name: Run Paint low-VRAM model-free self-test
+        shell: pwsh
+        run: |
           $LowVramSelfTest = @'
           import importlib.util
           import sys
@@ -81,6 +92,9 @@ jobs:
           $LowVramSelfTest | python -S -
           if ($LASTEXITCODE -ne 0) { throw "Paint low-VRAM self-test failed" }
 
+      - name: Parse PowerShell sources and verify GUI wait guard
+        shell: pwsh
+        run: |
           foreach ($ScriptPath in @(
             "build/build-hunyuan21-update.ps1",
             "build/hotfix-hunyuan21-rasterizer.ps1",
