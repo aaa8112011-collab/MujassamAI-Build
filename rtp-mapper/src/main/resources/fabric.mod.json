@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"id": "donut-smp-rtp-mapper",
+	"version": "${version}",
+	"name": "DonutSMP RTP Mapper",
+	"description": "Passively observes manually requested DonutSMP regional RTP landings, maps coordinates, and exports samples.",
+	"authors": [
+		"DonutSMP RTP Mapper Contributors"
+	],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"dev.donutsmp.rtpmapper.client.DonutRtpMapperClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": ">=0.141.6"
+	}
+}

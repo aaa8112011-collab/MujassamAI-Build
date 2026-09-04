@@ -1,0 +1,6 @@
+{
+	"key.donut-smp-rtp-mapper.open_mapper": "Open RTP Mapper",
+	"key.donut-smp-rtp-mapper.toggle_hud": "Toggle RTP HUD",
+	"key.donut-smp-rtp-mapper.toggle_mapping": "Start/Stop RTP Mapping",
+	"key.category.donut-smp-rtp-mapper.category": "DonutSMP RTP Mapper"
+}

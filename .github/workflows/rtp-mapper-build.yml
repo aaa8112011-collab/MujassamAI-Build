@@ -1,0 +1,112 @@
+name: Build DonutSMP RTP Mapper
+
+on:
+  push:
+    branches:
+      - codex/rtp-mapper-build
+    paths:
+      - "rtp-mapper/**"
+      - ".github/workflows/rtp-mapper-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle 9.2.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.2.1"
+
+      - name: Reject stale or automated source claims
+        working-directory: rtp-mapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          if rg -n 'Minecraft \*\*26\.1|Java \*\*25|Automated RTP loop|This mod automates|rtp (overworld|nether|end)' README.md; then
+            echo "Stale automated mapper documentation found"
+            exit 1
+          fi
+          if rg -n 'sendCommand|sendChat|performCommand|ServerboundChat|baritone|Input\.EMPTY|setDown|startAttack|continueAttack|destroyBlock|java\.net|okhttp|webhook' src --glob '!test/**'; then
+            echo "Forbidden automation or custom-network API found in source"
+            exit 1
+          fi
+
+      - name: Test and build
+        working-directory: rtp-mapper
+        run: gradle --no-daemon clean test build
+
+      - name: Inspect production JAR
+        working-directory: rtp-mapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t jars < <(find build/libs -maxdepth 1 -type f -name '*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' | sort)
+          if [ "${#jars[@]}" -ne 1 ]; then
+            printf 'Expected one production JAR, found %s\n' "${#jars[@]}"
+            exit 1
+          fi
+          jar_file="${jars[0]}"
+          unzip -tq "$jar_file"
+          audit_dir="$(mktemp -d)"
+          trap 'rm -rf "$audit_dir"' EXIT
+          unzip -qq "$jar_file" -d "$audit_dir"
+          unexpected="$(find "$audit_dir" -type f -name '*.class' -printf '%P\n' | grep -Ev '^dev/donutsmp/rtpmapper/' || true)"
+          if [ -n "$unexpected" ]; then
+            printf 'Unexpected classes:\n%s\n' "$unexpected"
+            exit 1
+          fi
+          test ! -d "$audit_dir/META-INF/jars"
+          if rg -a -n 'baritone|ServerboundChat(Command)?Packet|sendCommand|sendChat|performCommand|setDown|startAttack|continueAttack|destroyBlock|java/net/|java/net/http/|okhttp3/|org/apache/http/|webhook' "$audit_dir/dev"; then
+            echo "Forbidden automation or custom-network API found in production bytecode"
+            exit 1
+          fi
+          jq -e '
+            .environment == "client" and
+            .entrypoints.client == ["dev.donutsmp.rtpmapper.client.DonutRtpMapperClient"] and
+            .depends.minecraft == "~1.21.11" and
+            (has("mixins") | not) and
+            (has("accessWidener") | not) and
+            (.description | startswith("Passively"))
+          ' "$audit_dir/fabric.mod.json" >/dev/null
+
+      - name: Publish verified JAR on this branch
+        working-directory: rtp-mapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t jars < <(find build/libs -maxdepth 1 -type f -name '*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' | sort)
+          mkdir -p dist
+          output="dist/donut-smp-rtp-mapper-1.0.0+mc1.21.11.jar"
+          cp "${jars[0]}" "$output"
+          sha256sum "$output" > "${output}.sha256"
+          {
+            echo "Minecraft: 1.21.11"
+            echo "Fabric API: 0.141.6+1.21.11"
+            echo "Fabric Loader used to build: 0.19.5"
+            echo "Java: 21"
+            echo "Gradle: 9.2.1"
+            echo "Source commit: ${GITHUB_SHA}"
+          } > dist/BUILD-INFO.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/BUILD-INFO.txt "$output" "${output}.sha256"
+          git commit -m "Add verified RTP Mapper build" || exit 0
+          git push origin "HEAD:${GITHUB_REF_NAME}"
