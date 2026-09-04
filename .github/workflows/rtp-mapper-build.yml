@@ -44,7 +44,7 @@ jobs:
             echo "Stale automated mapper documentation found"
             exit 1
           fi
-          if rg -n 'sendCommand|sendChat|performCommand|ServerboundChat|baritone|Input\.EMPTY|setDown|startAttack|continueAttack|destroyBlock|java\.net|okhttp|webhook' src --glob '!test/**'; then
+          if rg -n 'sendCommand|sendChat|performCommand|ServerboundChat|baritone|Input\.EMPTY|setDown|startAttack|continueAttack|destroyBlock|java\.net|okhttp|webhook' src --glob '!src/test/**'; then
             echo "Forbidden automation or custom-network API found in source"
             exit 1
           fi
@@ -107,6 +107,6 @@ jobs:
           } > dist/BUILD-INFO.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dist/BUILD-INFO.txt "$output" "${output}.sha256"
+          git add -f dist/BUILD-INFO.txt "$output" "${output}.sha256"
           git commit -m "Add verified RTP Mapper build" || exit 0
           git push origin "HEAD:${GITHUB_REF_NAME}"
