@@ -1,0 +1,6 @@
+Minecraft: 1.21.11
+Fabric API: 0.141.6+1.21.11
+Fabric Loader used to build: 0.19.5
+Java: 21
+Gradle: 9.2.1
+Source commit: 1b91c4a9e8c569d0b30044735f397d02390ae27b
